@@ -57,6 +57,7 @@ import {
 } from "@/hooks/useWorkspaceChangedFiles";
 import { cn } from "@/lib/utils";
 import { isNativeWrapper as isNativeWrapperLabel } from "@/lib/nativeCodingAgents";
+import { useServerInfo } from "@/lib/CapabilitiesContext";
 import { isCurrentServerLocal } from "@/lib/serverOrigin";
 import { useChatStore } from "@/store/chatStore";
 import { livenessRowFromSession, useSessionLiveness } from "@/hooks/useSessionLiveness";
@@ -357,10 +358,18 @@ export function AppShell() {
   // the server's parent-delegation path — so we hide the affordance.
   const canShare =
     !!conversationId && isKnownTopLevel && (permissionLevel === null || permissionLevel >= 3);
-  const shareDisabled = canShare && isCurrentServerLocal();
-  const shareDisabledReason = shareDisabled
-    ? "Sharing is unavailable from a local server."
-    : undefined;
+  // Two independent reasons the Share affordance is present-but-disabled: a
+  // local single-user server can't share at all, and a deployed server whose
+  // admin set OMNIGENT_SHARING_MODE=off reports sharing_mode "off" via
+  // /v1/info. Fail open (share enabled) while the capability probe loads.
+  const serverInfo = useServerInfo();
+  const sharingOff = serverInfo !== "loading" && serverInfo.sharing_mode === "off";
+  const shareDisabled = canShare && (isCurrentServerLocal() || sharingOff);
+  const shareDisabledReason = !shareDisabled
+    ? undefined
+    : isCurrentServerLocal()
+      ? "Sharing is unavailable from a local server."
+      : "Sharing has been disabled for this Omnigent server.";
   // Any viewer can fork a shared session; top-level only (the server
   // rejects forking a sub-agent). Surfaced as ForkDialogContext.canFork —
   // the per-message "Fork from here" action is the only fork entry point.
