@@ -19,15 +19,15 @@ spawn: true
 # Orchestrator "brain": Claude Agent SDK. polly writes no code itself — it
 # delegates ALL coding work (investigation, implementation, review) to the
 # claude_code / codex / opencode / cursor / hermes / pi sub-agents, doing only non-code authoring (docs /
-# Markdown / text edits, skills) itself. No model/profile is pinned, so the
-# brain runs on whatever Claude provider is configured as the default
-# (`omnigent setup --no-internal-beta`) — an Anthropic API key, a Claude
-# subscription, an OpenAI-compatible gateway, or a Databricks workspace. With
-# no model named the claude-sdk harness resolves the configured provider's
-# default Claude model (the bundled catalog default is claude-opus-4-8).
+# Markdown / text edits, skills) itself. Auth still comes from whatever Claude
+# provider is configured as the default (`omnigent setup --no-internal-beta`) —
+# an Anthropic API key, a Claude subscription, an OpenAI-compatible gateway, or
+# a Databricks workspace — but the brain is pinned to Sonnet 5 for faster
+# planning turns (override with ``/model`` or ``-m``).
 executor:
   type: omnigent
   context_window: 1000000
+  model: claude-sonnet-5
   config:
     harness: claude-sdk
 

@@ -1697,6 +1697,33 @@ def test_apply_overrides_harness_and_model_together_for_spec_version_bundle() ->
     assert executor["model"] == "databricks-claude-sonnet-4-6"
 
 
+def test_apply_overrides_harness_only_clears_pinned_model() -> None:
+    """
+    ``--harness`` alone drops a prior ``executor.model`` pin.
+
+    Polly pins Sonnet 5 on its claude-sdk brain; swapping the brain to
+    ``pi`` / ``openai-agents`` must not leave that Claude id behind for a
+    harness that can't run it. Pair with ``--model`` to keep a pin.
+    """
+    raw: dict[str, object] = {
+        "spec_version": 1,
+        "name": "polly",
+        "prompt": "orchestrate",
+        "executor": {
+            "type": "omnigent",
+            "model": "claude-sonnet-5",
+            "config": {"harness": "claude-sdk"},
+        },
+    }
+
+    _apply_overrides_to_raw(raw, ChatOverrides(harness="pi"))
+
+    executor = raw["executor"]
+    assert isinstance(executor, dict)
+    assert executor["config"]["harness"] == "pi"
+    assert executor.get("model") is None
+
+
 def test_apply_overrides_rejects_harness_for_non_omnigent_executor_type() -> None:
     """
     A spec_version bundle with a non-omnigent ``executor.type`` fails

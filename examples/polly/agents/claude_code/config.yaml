@@ -4,6 +4,8 @@ description: Claude Code coding sub-agent — implements, cross-vendor reviews, 
 
 executor:
   type: omnigent
+  # Faster default for Polly Claude Code workers; override per-session with ``/model``.
+  model: claude-sonnet-5
   config:
     harness: claude-native
     # Headless workers can't answer ApprovalCards, and managed Claude

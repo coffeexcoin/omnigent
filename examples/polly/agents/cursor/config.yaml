@@ -10,6 +10,10 @@ description: Cursor coding sub-agent — implements, cross-vendor reviews, or ex
 # ``permission_mode: auto`` for Smart Auto (``--auto-review``) instead.
 executor:
   type: omnigent
+  # Faster default for Polly Cursor workers; override per-session with ``/model``.
+  # Must be the compound id from ``cursor-agent models`` (bare ``cursor-grok-4.5``
+  # is rejected — use ``cursor-grok-4.5-high`` / ``-medium`` / ``-low``).
+  model: cursor-grok-4.5-high
   config:
     harness: cursor-native
     # YOLO: headless workers can't answer approval prompts, so run
