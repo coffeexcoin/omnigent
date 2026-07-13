@@ -64,6 +64,8 @@ def _backend_of(database_uri: str | None) -> str:
         return "sqlite"
     if database_uri.startswith("postgres"):
         return "postgres"
+    if database_uri.startswith("mysql"):
+        return "mysql"
     return "other"
 
 
@@ -178,10 +180,10 @@ def _parse_args(argv: list[str]) -> argparse.Namespace:
         "--database-uri",
         default=None,
         metavar="URI",
-        help="DB the server boots against — a pre-seeded SQLite file or a "
-        "postgresql+psycopg://… instance (see seed.py). Default: a fresh "
-        "throwaway SQLite DB (empty — best-case numbers). The report's "
-        "`backend` field is derived from this.",
+        help="DB the server boots against — a pre-seeded SQLite file, a "
+        "postgresql+psycopg://… instance, or a mysql+mysqldb://… instance "
+        "(see seed.py). Default: a fresh throwaway SQLite DB (empty — "
+        "best-case numbers). The report's `backend` field is derived from this.",
     )
     parser.add_argument(
         "--iterations",

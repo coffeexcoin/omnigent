@@ -60,6 +60,14 @@ def _smoke_args(**overrides: object) -> argparse.Namespace:
 # ── pure-layer unit checks (no server) ───────────────────────
 
 
+def test_backend_of_classifies_uri_schemes() -> None:
+    """The report's backend label is derived from the URI scheme."""
+    assert bench_run._backend_of(None) == "sqlite"
+    assert bench_run._backend_of("sqlite:////abs/bench.db") == "sqlite"
+    assert bench_run._backend_of("postgresql+psycopg://u@h:5432/db") == "postgres"
+    assert bench_run._backend_of("mysql+mysqldb://u@h:3306/db") == "mysql"
+
+
 def test_percentile_and_throughput() -> None:
     r = RunResult(latencies_ms=[10.0, 20.0, 30.0, 40.0], wall_time=2.0)
     assert r.n_success == 4
