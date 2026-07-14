@@ -1993,8 +1993,10 @@ def test_list_child_conversation_ids_by_parent_groups_direct_subagents(
     The sessions list uses this helper to roll child runner status onto
     parent rows without issuing one ``child_sessions`` query per sidebar
     row. This test proves the helper returns every requested parent key,
-    excludes other parents and non-sub-agent children, and does not widen
-    from direct children to nested descendants.
+    excludes other parents, and does not widen from direct children to
+    nested descendants. A conversation is a sub-agent iff it has a parent
+    (``kind`` is derived from parent-nullness), so every parented row here
+    is a direct child of its parent.
     """
     parent_a = conversation_store.create_conversation()
     parent_b = conversation_store.create_conversation()
@@ -2006,9 +2008,6 @@ def test_list_child_conversation_ids_by_parent_groups_direct_subagents(
     )
     child_b = conversation_store.create_conversation(
         kind="sub_agent", title="coder:other", parent_conversation_id=parent_b.id
-    )
-    default_child = conversation_store.create_conversation(
-        kind="default", title="default:child", parent_conversation_id=parent_a.id
     )
     nested = conversation_store.create_conversation(
         kind="sub_agent", title="reviewer:nested", parent_conversation_id=child_a1.id
@@ -2023,8 +2022,11 @@ def test_list_child_conversation_ids_by_parent_groups_direct_subagents(
     assert sorted(result[parent_a.id]) == sorted([child_a1.id, child_a2.id])
     assert result[parent_b.id] == [child_b.id]
     assert result["conv_missing"] == []
-    assert default_child.id not in result[parent_a.id]
+    # A grandchild is a direct child of child_a1, not of parent_a — the helper
+    # groups by the immediate parent and does not widen to nested descendants.
     assert nested.id not in result[parent_a.id]
+    nested_result = conversation_store.list_child_conversation_ids_by_parent([child_a1.id])
+    assert nested_result[child_a1.id] == [nested.id]
 
 
 # ── agent_id filter on list_conversations ──────────────

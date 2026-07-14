@@ -162,6 +162,71 @@ def test_list_conversations_archived_filter(store: SqlAlchemyConversationStore) 
     assert any(c.archived for c in all_.data)
 
 
+def test_kind_derived_from_parent_nullness_not_metadata(
+    omnigent_db: Path,
+    store: SqlAlchemyConversationStore,
+) -> None:
+    """``kind`` is read from parent-nullness, so it stays correct even when the
+    metadata row (the old source of the ``kind`` column) is missing.
+
+    Simulates a create that crashed after the AP conversation row landed but
+    before the Omnigent metadata row: deleting the metadata row must not flip a
+    child's kind back to ``"default"``.
+    """
+    parent = store.create_conversation(title="parent")
+    child = store.create_conversation(
+        kind="sub_agent", title="coder:child", parent_conversation_id=parent.id
+    )
+
+    # Drop the child's metadata row to mimic a crashed create (orphaned AP row).
+    with sqlite3.connect(str(omnigent_db)) as conn:
+        conn.execute("DELETE FROM omnigent_conversation_metadata WHERE id = ?", (child.id,))
+
+    fetched = store.get_conversation(child.id)
+    assert fetched is not None
+    assert fetched.kind == "sub_agent"
+    # And the parent-scoped listing still finds it despite the missing metadata.
+    page = store.list_conversations(kind="sub_agent", parent_conversation_id=parent.id)
+    assert [c.id for c in page.data] == [child.id]
+
+
+def test_child_listing_does_not_prefetch_workspace_wide(
+    monkeypatch: pytest.MonkeyPatch,
+    store: SqlAlchemyConversationStore,
+) -> None:
+    """The parent-scoped child listing must not open an Omnigent-pool session to
+    prefetch a workspace-wide id set — the post-split slowdown this fixes.
+
+    Fails the test if ``list_conversations(parent_conversation_id=...)`` touches
+    ``self._session`` (the Omnigent pool) for a kind/archived prefetch. It may
+    still use ``self._conv_session`` (the AP pool) freely, and it reads metadata
+    for the returned page via a separate, bounded ``self._session`` call — which
+    is why we only assert the *prefetch* path is gone by counting sessions: a
+    parent-scoped page fetch opens the Omnigent pool at most once (page-metadata
+    merge), never twice (prefetch + merge).
+    """
+    parent = store.create_conversation(title="parent")
+    for i in range(3):
+        store.create_conversation(
+            kind="sub_agent", title=f"coder:c{i}", parent_conversation_id=parent.id
+        )
+
+    calls = {"omnigent_sessions": 0}
+    real_session = store._session
+
+    def counting_session(*args: object, **kwargs: object) -> object:
+        calls["omnigent_sessions"] += 1
+        return real_session(*args, **kwargs)
+
+    monkeypatch.setattr(store, "_session", counting_session)
+    page = store.list_conversations(kind="sub_agent", parent_conversation_id=parent.id)
+
+    assert len(page.data) == 3
+    # One Omnigent-pool session for the page-metadata merge; the workspace-wide
+    # prefetch (a second, unbounded one) must be gone.
+    assert calls["omnigent_sessions"] <= 1
+
+
 # ── labels ─────────────────────────────────────────────
 
 

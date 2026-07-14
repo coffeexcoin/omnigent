@@ -40,7 +40,6 @@ from omnigent.db.db_models import (
     current_workspace_id,
 )
 from omnigent.db.enum_codecs import (
-    decode_conversation_kind,
     decode_item_status,
     decode_item_type,
     encode_agent_kind,
@@ -126,7 +125,11 @@ def _to_conversation(
         created_at=row.created_at,
         updated_at=row.updated_at,
         title=row.title or None,  # empty string → None at entity layer
-        kind=decode_conversation_kind(meta.kind) if meta else "default",
+        # kind is derived from parent-nullness, not the stored metadata column:
+        # a conversation is a sub-agent iff it has a parent. This is the single
+        # source of truth (every writer couples them) and stays correct even for
+        # an orphaned row whose metadata write crashed (``meta is None``).
+        kind="sub_agent" if row.parent_conversation_id is not None else "default",
         parent_conversation_id=row.parent_conversation_id,
         root_conversation_id=row.root_conversation_id,
         agent_id=agent_config.agent_id if agent_config else None,
@@ -1125,10 +1128,13 @@ class SqlAlchemyConversationStore(ConversationStore):
         """
         Return direct sub-agent child ids grouped by parent conversation.
 
-        Uses the partial ``idx_conversations_parent`` index by filtering on
-        ``kind="sub_agent"`` plus ``parent_conversation_id IN (...)``. This
-        gives sidebar session-list status roll-up one batched identity query
-        instead of one full child listing per visible parent row.
+        A conversation has a parent iff it is a sub-agent (``kind`` is fully
+        determined by parent nullness), so filtering on
+        ``parent_conversation_id IN (...)`` alone already yields exactly the
+        sub-agent children — no metadata ``kind`` lookup needed. This resolves
+        as one batched query on the AP ``idx_conversations_parent`` index,
+        giving sidebar session-list status roll-up one identity query instead
+        of one full child listing per visible parent row.
 
         :param parent_conversation_ids: Parent conversation ids to
             inspect, e.g. ``["conv_parent1", "conv_parent2"]``.
@@ -1142,26 +1148,11 @@ class SqlAlchemyConversationStore(ConversationStore):
         if not unique_ids:
             return result
 
-        # kind is in the Omnigent DB (metadata); get IDs of sub_agent conversations.
-        sub_agent_kind = encode_conversation_kind("sub_agent")
-        with self._session() as meta_sess:
-            sub_agent_ids = set(
-                meta_sess.execute(
-                    select(SqlConversationMetadata.id).where(
-                        SqlConversationMetadata.workspace_id == current_workspace_id(),
-                        SqlConversationMetadata.kind == sub_agent_kind,
-                    )
-                )
-                .scalars()
-                .all()
-            )
-
         with self._conv_session() as ap_sess:
             rows = ap_sess.execute(
                 select(SqlConversation.parent_conversation_id, SqlConversation.id)
                 .where(SqlConversation.workspace_id == current_workspace_id())
                 .where(SqlConversation.parent_conversation_id.in_(unique_ids))
-                .where(SqlConversation.id.in_(sub_agent_ids))
                 .order_by(
                     SqlConversation.parent_conversation_id,
                     desc(SqlConversation.created_at),
@@ -2032,12 +2023,28 @@ class SqlAlchemyConversationStore(ConversationStore):
         is_desc = order == "desc"
         sort_fn = desc if is_desc else asc
 
-        # Determine if we need Omnigent-side filtering (kind/archived/permissions).
+        # ``kind`` is fully determined by ``parent_conversation_id`` nullness — a
+        # child always has a parent, a top-level session never does — so the kind
+        # filter is expressed directly on the AP ``conversations`` table below
+        # instead of prefetching the metadata ``kind`` column across the pool.
+        kind_requires_parent: bool | None = None
+        if kind == "sub_agent":
+            kind_requires_parent = True
+        elif kind == "default":
+            kind_requires_parent = False
+
+        # A metadata-side prefetch is only needed for filters that live on the
+        # Omnigent DB: the permission scopes and (workspace-wide) archived
+        # exclusion. When the query is scoped to a single parent's children, skip
+        # the prefetch — a parent's children are a small, bounded set reachable
+        # via ``idx_conversations_parent``, so ``archived`` is applied on the
+        # page's own metadata after the fetch. A workspace-wide id prefetch here
+        # (the pre-fix behaviour) is both needless and the source of the
+        # post-split child-session slowdown.
+        parent_scoped = parent_conversation_id is not None
+        archived_via_prefetch = (not include_archived) and not parent_scoped
         needs_meta_filter = (
-            (kind is not None)
-            or (not include_archived)
-            or (accessible_by is not None)
-            or (owned_by is not None)
+            archived_via_prefetch or (accessible_by is not None) or (owned_by is not None)
         )
 
         qualifying_ids: list[str] | None = None
@@ -2047,11 +2054,7 @@ class SqlAlchemyConversationStore(ConversationStore):
                 meta_q = select(SqlConversationMetadata.id).where(
                     SqlConversationMetadata.workspace_id == current_workspace_id()
                 )
-                if kind is not None:
-                    meta_q = meta_q.where(
-                        SqlConversationMetadata.kind == encode_conversation_kind(kind)
-                    )
-                if not include_archived:
+                if archived_via_prefetch:
                     meta_q = meta_q.where(SqlConversationMetadata.archived.is_(False))
                 if accessible_by is not None:
                     accessible_ids = select(SqlSessionPermission.conversation_id).where(
@@ -2075,6 +2078,12 @@ class SqlAlchemyConversationStore(ConversationStore):
 
             if qualifying_ids is not None:
                 stmt = stmt.where(SqlConversation.id.in_(qualifying_ids))
+
+            # Kind filter as parent-nullness (see above): sub_agent ⇔ parent set.
+            if kind_requires_parent is True:
+                stmt = stmt.where(SqlConversation.parent_conversation_id.is_not(None))
+            elif kind_requires_parent is False:
+                stmt = stmt.where(SqlConversation.parent_conversation_id.is_(None))
 
             if parent_conversation_id is not None:
                 stmt = stmt.where(
@@ -2230,6 +2239,14 @@ class SqlAlchemyConversationStore(ConversationStore):
                 ]
         else:
             convs = []
+        # Parent-scoped listing skips the metadata prefetch, so apply the
+        # archived exclusion here on the page's own (already-fetched) metadata.
+        # A parent's children are a small, bounded set and are not archived in
+        # practice (archiving is an owner-gated top-level action with no
+        # child cascade), so this filter is a no-op in the common case and
+        # never yields a short page; ``has_more`` stays conservative.
+        if parent_scoped and not include_archived:
+            convs = [conv for conv in convs if not conv.archived]
         for conv in convs:
             conv.search_snippet = snippets.get(conv.id)
         return PagedList(
