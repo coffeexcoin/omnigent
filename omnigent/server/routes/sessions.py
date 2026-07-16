@@ -608,6 +608,12 @@ _NATIVE_TERMINAL_ENSURE_FAILED_CODE = "native_terminal_ensure_failed"
 _NATIVE_POLICY_NOT_ENFORCED_CODE = "native_policy_not_enforced"
 _HOST_BOUND_RUNNER_CONNECT_GRACE_S = 10.0
 _HOST_RELAUNCH_RUNNER_CONNECT_TIMEOUT_S = 30.0
+# Wait budget for the host's ``host.runner_status`` reply. The host answers
+# from an in-memory dict (a ``Popen.poll()``), so the round-trip is just the
+# tunnel latency. Kept short: this gates the connect grace, and a slow/absent
+# reply falls through to the grace wait (the prior blind-wait behavior), so
+# the query can only make the cold path faster, never slower.
+_HOST_RUNNER_STATUS_TIMEOUT_S = 3.0
 _MANAGED_RESUMABLE_TUNNEL_STALE_S = 30.0
 # How often the runner-connect wait re-checks the crash-report store while
 # racing the event-driven connect signal. Small enough that conviction is
@@ -6158,6 +6164,148 @@ async def _get_runner_client(
             )
             return None
     return cast("httpx.AsyncClient | None", get_runner_client())
+
+
+async def _query_host_runner_status(
+    host_conn: HostConnection,
+    host_registry: HostRegistry,
+    runner_id: str,
+) -> str | None:
+    """
+    Ask a host whether a runner's process is alive, dead, or unknown.
+
+    The host owns runner-process liveness (it holds the ``Popen``), so it
+    can answer the one question the server's tunnel registry cannot: is an
+    absent-from-the-tunnel runner still coming (booting) or gone for good
+    (stopped, crashed, or lost to a host restart)? Used before the connect
+    grace so the dispatch path waits only for a runner that is coming.
+
+    :param host_conn: Live host connection to query.
+    :param host_registry: Registry used to enqueue the outbound frame.
+    :param runner_id: Runner to ask about, e.g. ``"runner_abc123..."``.
+    :returns: ``"alive"``, ``"dead"``, or ``"unknown"`` from the host; or
+        ``None`` when the host didn't reply in time, the connection
+        dropped, or the host is too old to support the query. ``None``
+        means "no authoritative answer" — the caller falls back to the
+        plain connect grace, preserving the prior blind-wait behavior.
+    """
+    from omnigent.host.frames import HostRunnerStatusFrame, encode_host_frame
+
+    request_id = secrets.token_hex(8)
+    future: asyncio.Future[dict[str, str | None]] = asyncio.get_running_loop().create_future()
+    host_conn.pending_runner_status[request_id] = future
+    frame = encode_host_frame(HostRunnerStatusFrame(request_id=request_id, runner_id=runner_id))
+    try:
+        try:
+            host_registry.send_text(host_conn, frame)
+        except ConnectionError:
+            return None
+        result = await asyncio.wait_for(
+            future,
+            timeout=_HOST_RUNNER_STATUS_TIMEOUT_S,
+        )
+    except asyncio.TimeoutError:
+        return None
+    except Exception:  # noqa: BLE001
+        # Defensive: this query only ever *speeds up* the connect grace, so
+        # any unexpected failure (e.g. the future resolved with an error)
+        # must degrade to "no verdict" and fall back to the wait rather than
+        # break the message POST. CancelledError is a BaseException and still
+        # propagates, so the race helper's cancel/drain is unaffected.
+        _logger.warning(
+            "host.runner_status query for runner %s failed; falling back to grace",
+            runner_id,
+            exc_info=True,
+        )
+        return None
+    finally:
+        host_conn.pending_runner_status.pop(request_id, None)
+    return result.get("status")
+
+
+async def _wait_for_host_bound_runner_client(
+    session_id: str,
+    runner_router: RunnerRouter | None,
+    tunnel_registry: TunnelRegistry | None,
+    *,
+    runner_id: str,
+    timeout_s: float,
+    runner_exit_reports: RunnerExitReports | None,
+    host_conn: HostConnection,
+    host_registry: HostRegistry,
+) -> httpx.AsyncClient | None:
+    """
+    Wait for a host-bound runner to connect, ending early if the host
+    reports it already gone.
+
+    Races the connect grace (:func:`_wait_for_runner_client`) against a
+    one-shot ``host.runner_status`` query, because they answer different
+    questions and either can settle the outcome first:
+
+    * The runner connecting — or a crash report — resolves the wait exactly
+      as :func:`_wait_for_runner_client` does. This is ground truth and
+      always wins when it lands first.
+    * Concurrently, the host — the authoritative owner of runner-process
+      liveness — may report the runner ``dead`` or ``unknown`` (stopped,
+      crashed, or lost to a host restart). That means it will never
+      connect, so the wait ends immediately and the caller relaunches
+      without burning the rest of the grace.
+
+    Running the query *alongside* the wait rather than before it is what
+    keeps the query strictly a speed-up: a host that is too old to answer,
+    slow, or silent (verdict ``None`` / ``"alive"``) never shortcuts the
+    wait, so the connect grace runs its normal course with no added
+    latency.
+
+    :param session_id: Session/conversation identifier.
+    :param runner_router: The ``RunnerRouter`` instance, or ``None``.
+    :param tunnel_registry: The server's ``TunnelRegistry``, or ``None``.
+    :param runner_id: Runner id expected to connect.
+    :param timeout_s: Maximum seconds to wait for the connect.
+    :param runner_exit_reports: Crash-report store consulted by the
+        connect wait to abort early on a reported death.
+    :param host_conn: Live host connection to query for liveness.
+    :param host_registry: Registry used to enqueue the query frame.
+    :returns: The runner HTTP client if it connected, otherwise ``None``
+        (timed out, crash report, or host-confirmed dead/unknown).
+    """
+    connect_task = asyncio.ensure_future(
+        _wait_for_runner_client(
+            session_id,
+            runner_router,
+            tunnel_registry,
+            runner_id=runner_id,
+            timeout_s=timeout_s,
+            runner_exit_reports=runner_exit_reports,
+        )
+    )
+    status_task = asyncio.ensure_future(
+        _query_host_runner_status(host_conn, host_registry, runner_id)
+    )
+    try:
+        done, _pending = await asyncio.wait(
+            {connect_task, status_task},
+            return_when=asyncio.FIRST_COMPLETED,
+        )
+        # The connect settling is authoritative (client, timeout, or crash
+        # report) — the host's opinion no longer matters once it lands.
+        if connect_task in done:
+            return connect_task.result()
+        # Only the status query has resolved so far.
+        if status_task.result() in ("dead", "unknown"):
+            # Host confirms the runner will never connect — stop waiting.
+            return None
+        # No verdict ("alive" or an unavailable/too-old/slow host): let the
+        # connect grace run to its natural conclusion.
+        return await connect_task
+    finally:
+        outstanding = [t for t in (connect_task, status_task) if not t.done()]
+        for task in outstanding:
+            task.cancel()
+        if outstanding:
+            # Drain the cancelled task(s); return_exceptions swallows the
+            # CancelledError so cleanup never masks the real return/raise.
+            await asyncio.gather(*outstanding, return_exceptions=True)
 
 
 async def _wait_for_runner_client(
@@ -20363,10 +20511,23 @@ def create_sessions_router(
                 runner_client = await _get_runner_client(session_id, runner_router)
         if runner_client is None and conv.host_id is not None:
             _tunnel_registry = getattr(request.app.state, "tunnel_registry", None)
+            _grace_host_reg = getattr(request.app.state, "host_registry", None)
+            _grace_host_conn = (
+                _grace_host_reg.get(conv.host_id) if _grace_host_reg is not None else None
+            )
             # A just-created host session already has a runner_id before
             # the runner's tunnel is registered. The Web UI can post the
             # first message during that gap; wait briefly for the pinned
-            # runner before treating it as dead and replacing it.
+            # runner before treating it as dead and replacing it — but end
+            # that wait early when the runner is not actually coming. The
+            # host owns runner-process liveness (it holds the Popen), so we
+            # race a ``host.runner_status`` query against the connect grace:
+            # a booting runner connects (or reads "alive") and we forward,
+            # while one that was stopped, crashed, or lost to a host restart
+            # reads "dead"/"unknown" and cuts the wait short so the relaunch
+            # below runs at once. A host that is offline, too old to answer,
+            # or slow yields no verdict and the grace runs its normal
+            # course, so the query only ever speeds up the cold path.
             if conv.runner_id is not None and _HOST_BOUND_RUNNER_CONNECT_GRACE_S > 0:
                 _logger.info(
                     "Waiting up to %.1fs for host-bound runner %s to register "
@@ -20375,14 +20536,28 @@ def create_sessions_router(
                     conv.runner_id,
                     session_id,
                 )
-                runner_client = await _wait_for_runner_client(
-                    session_id,
-                    runner_router,
-                    _tunnel_registry,
-                    runner_id=conv.runner_id,
-                    timeout_s=_HOST_BOUND_RUNNER_CONNECT_GRACE_S,
-                    runner_exit_reports=runner_exit_reports,
-                )
+                if _grace_host_conn is not None:
+                    runner_client = await _wait_for_host_bound_runner_client(
+                        session_id,
+                        runner_router,
+                        _tunnel_registry,
+                        runner_id=conv.runner_id,
+                        timeout_s=_HOST_BOUND_RUNNER_CONNECT_GRACE_S,
+                        runner_exit_reports=runner_exit_reports,
+                        host_conn=_grace_host_conn,
+                        host_registry=_grace_host_reg,
+                    )
+                else:
+                    # Host tunnel absent: no one to query, so this is the
+                    # plain connect grace (unchanged pre-existing behavior).
+                    runner_client = await _wait_for_runner_client(
+                        session_id,
+                        runner_router,
+                        _tunnel_registry,
+                        runner_id=conv.runner_id,
+                        timeout_s=_HOST_BOUND_RUNNER_CONNECT_GRACE_S,
+                        runner_exit_reports=runner_exit_reports,
+                    )
             # Runner is dead or still not spawned for a host-bound
             # session. Ask the host to launch one, then re-fetch the
             # runner client and wait briefly for it to connect before

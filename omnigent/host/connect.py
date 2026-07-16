@@ -43,6 +43,8 @@ from omnigent.host.frames import (
     HostRemoveWorktreeFrame,
     HostRemoveWorktreeResultFrame,
     HostRunnerExitedFrame,
+    HostRunnerStatusFrame,
+    HostRunnerStatusResultFrame,
     HostStatFrame,
     HostStatResultFrame,
     HostStopRunnerFrame,
@@ -1191,6 +1193,37 @@ class HostProcess:
             status="stopped",
         )
 
+    def _handle_runner_status(
+        self,
+        frame: HostRunnerStatusFrame,
+    ) -> HostRunnerStatusResultFrame:
+        """Answer whether a runner's process is alive, dead, or unknown.
+
+        The host is the authoritative owner of runner liveness: it holds
+        the runner's :class:`subprocess.Popen`. A runner tracked with a
+        still-running process is ``alive`` (covers a runner that is still
+        booting — it is inserted at ``Popen`` time, before its tunnel
+        connects — so the server waits for it). A tracked-but-exited
+        process is ``dead``. A runner this host has no record of is
+        ``unknown`` — it was stopped (``_handle_stop`` popped it) or a
+        fresh post-restart host never spawned it; either way it will never
+        connect, so the server relaunches without waiting.
+
+        :param frame: The status query frame.
+        :returns: Result frame with ``alive`` / ``dead`` / ``unknown``.
+        """
+        handle = self._runners.get(frame.runner_id)
+        if handle is None:
+            status = "unknown"
+        elif handle.proc.poll() is None:
+            status = "alive"
+        else:
+            status = "dead"
+        return HostRunnerStatusResultFrame(
+            request_id=frame.request_id,
+            status=status,
+        )
+
     async def _watch_runner(self, runner_id: str) -> None:
         """Watch a spawned runner and report an unexpected exit.
 
@@ -2068,6 +2101,8 @@ class HostProcess:
             await ws.send(encode_host_frame(await self._handle_launch(frame)))
         elif isinstance(frame, HostStopRunnerFrame):
             await ws.send(encode_host_frame(self._handle_stop(frame)))
+        elif isinstance(frame, HostRunnerStatusFrame):
+            await ws.send(encode_host_frame(self._handle_runner_status(frame)))
         elif isinstance(frame, HostStatFrame):
             await ws.send(encode_host_frame(self._handle_stat(frame)))
         elif isinstance(frame, HostListDirFrame):

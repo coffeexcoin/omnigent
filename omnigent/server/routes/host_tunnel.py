@@ -36,6 +36,7 @@ from omnigent.host.frames import (
     HostListWorktreesResultFrame,
     HostRemoveWorktreeResultFrame,
     HostRunnerExitedFrame,
+    HostRunnerStatusResultFrame,
     HostStatResultFrame,
     HostStopRunnerResultFrame,
     decode_host_frame,
@@ -481,6 +482,12 @@ async def _receive_loop(
                 # connecting its tunnel has no runner-tunnel disconnect
                 # event, so this report is the only failure signal.
                 await on_runner_exited(frame.runner_id, frame.error)
+            continue
+
+        if isinstance(frame, HostRunnerStatusResultFrame):
+            status_future = conn.pending_runner_status.pop(frame.request_id, None)
+            if status_future is not None and not status_future.done():
+                status_future.set_result({"status": frame.status})
             continue
 
         if isinstance(frame, HostStatResultFrame):

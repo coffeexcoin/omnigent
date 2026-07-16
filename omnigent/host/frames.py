@@ -43,6 +43,8 @@ class HostFrameKind(str, Enum):
     STOP_RUNNER = "host.stop_runner"
     STOP_RUNNER_RESULT = "host.stop_runner_result"
     RUNNER_EXITED = "host.runner_exited"
+    RUNNER_STATUS = "host.runner_status"
+    RUNNER_STATUS_RESULT = "host.runner_status_result"
     STAT = "host.stat"
     STAT_RESULT = "host.stat_result"
     LIST_DIR = "host.list_dir"
@@ -201,6 +203,48 @@ class HostRunnerExitedFrame:
 
     runner_id: str
     error: str
+
+
+@dataclass
+class HostRunnerStatusFrame:
+    """Server → host: is this runner's process alive, dead, or unknown?
+
+    The host is the authoritative owner of runner-process liveness — it
+    holds each runner's :class:`subprocess.Popen`. The runner tunnel
+    only tells the server "connected right now"; it cannot distinguish a
+    runner that is still booting (will connect) from one that was stopped
+    or died when the host restarted (never will). The message-dispatch
+    path asks this before its connect grace so it waits for a runner that
+    is coming and relaunches immediately for one that is not.
+
+    :param request_id: Unique id for correlating the result, e.g.
+        ``"req_rs_1"``.
+    :param runner_id: Runner to query, e.g. ``"runner_abc123..."``.
+    """
+
+    request_id: str
+    runner_id: str
+
+
+@dataclass
+class HostRunnerStatusResultFrame:
+    """Host → server: liveness of a queried runner.
+
+    :param request_id: Correlates to the :class:`HostRunnerStatusFrame`,
+        e.g. ``"req_rs_1"``.
+    :param status: One of:
+
+        * ``"alive"`` — the host has this runner and its process is
+          running (booting or serving). The runner is coming; wait.
+        * ``"dead"`` — the host has this runner but its process has
+          exited. It will never connect; relaunch now.
+        * ``"unknown"`` — the host has no record of this runner (it was
+          stopped, or a fresh post-restart host never spawned it).
+          Relaunch now.
+    """
+
+    request_id: str
+    status: str
 
 
 @dataclass
@@ -582,6 +626,8 @@ HostFrame = (
     | HostStopRunnerFrame
     | HostStopRunnerResultFrame
     | HostRunnerExitedFrame
+    | HostRunnerStatusFrame
+    | HostRunnerStatusResultFrame
     | HostStatFrame
     | HostStatResultFrame
     | HostListDirFrame
@@ -691,6 +737,22 @@ def encode_host_frame(frame: HostFrame) -> str:
                 "kind": HostFrameKind.RUNNER_EXITED.value,
                 "runner_id": frame.runner_id,
                 "error": frame.error,
+            }
+        )
+    if isinstance(frame, HostRunnerStatusFrame):
+        return _encode_payload(
+            {
+                "kind": HostFrameKind.RUNNER_STATUS.value,
+                "request_id": frame.request_id,
+                "runner_id": frame.runner_id,
+            }
+        )
+    if isinstance(frame, HostRunnerStatusResultFrame):
+        return _encode_payload(
+            {
+                "kind": HostFrameKind.RUNNER_STATUS_RESULT.value,
+                "request_id": frame.request_id,
+                "status": frame.status,
             }
         )
     if isinstance(frame, HostStatFrame):
@@ -915,6 +977,10 @@ def _decode_known_host_frame(
             return _decode_stop_runner_result(msg)
         case HostFrameKind.RUNNER_EXITED:
             return _decode_runner_exited(msg)
+        case HostFrameKind.RUNNER_STATUS:
+            return _decode_runner_status(msg)
+        case HostFrameKind.RUNNER_STATUS_RESULT:
+            return _decode_runner_status_result(msg)
         case HostFrameKind.STAT:
             return _decode_stat(msg)
         case HostFrameKind.STAT_RESULT:
@@ -1031,6 +1097,32 @@ def _decode_runner_exited(msg: dict[str, Any]) -> HostRunnerExitedFrame:
     return HostRunnerExitedFrame(
         runner_id=_required_str(msg, "runner_id"),
         error=_required_str(msg, "error"),
+    )
+
+
+def _decode_runner_status(msg: dict[str, Any]) -> HostRunnerStatusFrame:
+    """Decode a host.runner_status request frame.
+
+    :param msg: Decoded frame object.
+    :returns: Typed host.runner_status frame.
+    """
+    return HostRunnerStatusFrame(
+        request_id=_required_str(msg, "request_id"),
+        runner_id=_required_str(msg, "runner_id"),
+    )
+
+
+def _decode_runner_status_result(
+    msg: dict[str, Any],
+) -> HostRunnerStatusResultFrame:
+    """Decode a host.runner_status_result frame.
+
+    :param msg: Decoded frame object.
+    :returns: Typed host.runner_status_result frame.
+    """
+    return HostRunnerStatusResultFrame(
+        request_id=_required_str(msg, "request_id"),
+        status=_required_str(msg, "status"),
     )
 
 

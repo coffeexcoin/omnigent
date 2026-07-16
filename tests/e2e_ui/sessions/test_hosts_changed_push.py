@@ -115,6 +115,44 @@ def _patch_session_list(page: Page, session_id: str) -> None:
     page.route(re.compile(r"/v1/sessions(\?|$)"), _handler)
 
 
+def _patch_health_drops_session(page: Page, session_id: str) -> None:
+    """Drop ``session_id`` from ``GET /health`` batch responses.
+
+    The badge draws ``host_online`` from two independent sources: the
+    ``WS /v1/sessions/updates`` stream (intercepted here) and the
+    open-session ``/health`` poll. The real ``/health`` always emits
+    ``host_online`` for a session it finds — ``null`` when the session
+    isn't host-bound — and that ``null`` reaches ``useSessionHostOnline``
+    as a live signal, which ``HostBadge`` treats as authoritative
+    "unknown" and renders over the ``useHosts`` status this test drives.
+
+    Dropping the id from the ``sessions`` map leaves it *absent* (not
+    ``null``), so ``useSessionHostOnline`` stays ``undefined`` — "not
+    observed yet" — and the badge falls back to the ``useHosts`` status
+    field, exactly as the test intends. This mirrors the snapshot/list
+    patches: the browser is placed in a host-bound view whose liveness
+    comes solely from the controlled ``useHosts`` payload.
+    """
+
+    def _handler(route):  # type: ignore[no-untyped-def]
+        req = route.request
+        if req.method != "GET" or urlparse(req.url).path != "/health":
+            route.continue_()
+            return
+        resp = route.fetch()
+        payload = resp.json()
+        sessions = payload.get("sessions") if isinstance(payload, dict) else None
+        if isinstance(sessions, dict):
+            sessions.pop(session_id, None)
+        route.fulfill(
+            status=200,
+            headers={**resp.headers, "content-type": "application/json"},
+            body=json.dumps(payload),
+        )
+
+    page.route(re.compile(r"/health(\?|$)"), _handler)
+
+
 # ---------------------------------------------------------------------------
 # Tests
 # ---------------------------------------------------------------------------
@@ -154,6 +192,7 @@ def test_hosts_changed_frame_updates_host_badge(
     # Register routes before navigation so they're active on first request.
     _patch_session_snapshot(page, session_id)
     _patch_session_list(page, session_id)
+    _patch_health_drops_session(page, session_id)
     page.route_web_socket(re.compile(r"/v1/sessions/updates"), _handle_ws)
 
     # Start with "online" so we can observe a transition to "offline".

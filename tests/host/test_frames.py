@@ -25,6 +25,8 @@ from omnigent.host.frames import (
     HostRemoveWorktreeFrame,
     HostRemoveWorktreeResultFrame,
     HostRunnerExitedFrame,
+    HostRunnerStatusFrame,
+    HostRunnerStatusResultFrame,
     HostStatFrame,
     HostStatResultFrame,
     HostStopRunnerFrame,
@@ -388,6 +390,44 @@ def test_runner_exited_frame_missing_error_raises() -> None:
     """
     with pytest.raises(ValueError, match="missing required string field"):
         decode_host_frame('{"kind": "host.runner_exited", "runner_id": "runner_abc123"}')
+
+
+def test_runner_status_frame_round_trip() -> None:
+    """
+    Verify HostRunnerStatusFrame survives encode → decode.
+
+    A garbled runner_id here would make the host answer about the wrong
+    runner, so the dispatch path could wait for (or relaunch) the wrong
+    one.
+    """
+    original = HostRunnerStatusFrame(
+        request_id="req_rs_1",
+        runner_id="runner_token_abc",
+    )
+    decoded = decode_host_frame(encode_host_frame(original))
+    assert isinstance(decoded, HostRunnerStatusFrame)
+    assert decoded.request_id == "req_rs_1"
+    assert decoded.runner_id == "runner_token_abc"
+
+
+def test_runner_status_result_frame_round_trip() -> None:
+    """
+    Verify HostRunnerStatusResultFrame survives encode → decode for each
+    verdict.
+
+    ``status`` is the entire signal the dispatch gate acts on — a lossy
+    round-trip would make the server wait when it should relaunch, or
+    vice versa.
+    """
+    for status in ("alive", "dead", "unknown"):
+        original = HostRunnerStatusResultFrame(
+            request_id="req_rs_1",
+            status=status,
+        )
+        decoded = decode_host_frame(encode_host_frame(original))
+        assert isinstance(decoded, HostRunnerStatusResultFrame)
+        assert decoded.request_id == "req_rs_1"
+        assert decoded.status == status
 
 
 def test_decode_unknown_kind_raises() -> None:
