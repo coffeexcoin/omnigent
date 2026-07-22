@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import dataclasses
 import datetime
 from collections.abc import Callable
 from pathlib import Path
@@ -17,6 +18,11 @@ from omnigent.onboarding.sandboxes.base import render_host_config_write_command
 from omnigent.onboarding.sandboxes.e2b import managed_token_ttl_s as e2b_managed_token_ttl_s
 from omnigent.runtime.agent_cache import AgentCache
 from omnigent.server.app import create_app
+from omnigent.server.managed_credentials import (
+    ManagedCredentialHook,
+    ManagedCredentialLease,
+    ManagedLaunchContext,
+)
 from omnigent.server.managed_hosts import (
     BOXLITE_MANAGED_TOKEN_TTL_S,
     DAYTONA_MANAGED_TOKEN_TTL_S,
@@ -2125,3 +2131,393 @@ def test_parse_modal_secrets_malformed_fails_loud(secrets: object) -> None:
                 "modal": {"secrets": secrets},
             }
         )
+
+
+# ── credential hook seam ────────────────────────────────────
+
+
+class _FakeCredentialLease(ManagedCredentialLease):
+    """
+    Test lease carrying a secret that must never surface in repr/logs.
+
+    Records how often it is released so cleanup-semantics tests can assert
+    the managed-launch layer honours its one release obligation (failure of
+    the launch the lease was acquired for).
+
+    :param reference: The non-secret handle exposed to launcher startup.
+    :param secret: A stand-in credential value the lease must NOT leak
+        through :meth:`__repr__` / ``str`` — the redaction guarantee.
+    """
+
+    def __init__(
+        self,
+        reference: str | None = "managed-cred-abc123",
+        secret: str = "s3cr3t-token-value",
+    ) -> None:
+        self._reference = reference
+        self._secret = secret
+        self.release_calls = 0
+
+    @property
+    def reference(self) -> str | None:
+        """The non-secret handle the launcher would resolve."""
+        return self._reference
+
+    async def release(self) -> None:
+        """Count releases (the layer must call this at most once, on failure)."""
+        self.release_calls += 1
+
+
+class _FakeCredentialHook(ManagedCredentialHook):
+    """
+    Recording :class:`ManagedCredentialHook` for the seam tests.
+
+    Captures every :class:`ManagedLaunchContext` it is asked to resolve so a
+    test can assert the launch identity, and optionally fails the resolution
+    to exercise the abort-and-teardown path.
+
+    :param lease: The lease to hand back on success; a default fake when
+        ``None``.
+    :param fail: When ``True``, :meth:`acquire` raises instead of returning
+        a lease (simulates a resolver that cannot mint credentials).
+    """
+
+    def __init__(self, lease: _FakeCredentialLease | None = None, *, fail: bool = False) -> None:
+        self._lease = lease if lease is not None else _FakeCredentialLease()
+        self._fail = fail
+        self.contexts: list[ManagedLaunchContext] = []
+
+    @property
+    def lease(self) -> _FakeCredentialLease:
+        """The lease this hook resolves to."""
+        return self._lease
+
+    async def acquire(self, context: ManagedLaunchContext) -> ManagedCredentialLease:
+        """Record the context, then resolve to the lease (or fail)."""
+        self.contexts.append(context)
+        if self._fail:
+            raise RuntimeError("credential resolution failed")
+        return self._lease
+
+
+class _CredentialRefRecordingLauncher(FakeSandboxLauncher):
+    """
+    A fake launcher that records the ``credential_reference`` ``start_host``
+    received — the observable proof the resolved lease's non-secret handle
+    reached launcher startup through the generic seam.
+    """
+
+    def __init__(
+        self,
+        *,
+        on_host_start: Callable[[HostStartInvocation], None] | None = None,
+        fail_on_host_start: bool = False,
+    ) -> None:
+        super().__init__(on_host_start=on_host_start, fail_on_host_start=fail_on_host_start)
+        self.credential_references: list[str | None] = []
+
+    def start_host(
+        self,
+        sandbox_id: str,
+        *,
+        token: str,
+        host_id: str,
+        host_name: str,
+        server_url: str,
+        repo_url: str | None = None,
+        repo_branch: str | None = None,
+        repo_name: str | None = None,
+        host_config: dict[str, object] | None = None,
+        credential_reference: str | None = None,
+        on_stage: Callable[[str], None] | None = None,
+    ) -> str:
+        """Record the credential reference, then run the shared start path."""
+        self.credential_references.append(credential_reference)
+        return super().start_host(
+            sandbox_id,
+            token=token,
+            host_id=host_id,
+            host_name=host_name,
+            server_url=server_url,
+            repo_url=repo_url,
+            repo_branch=repo_branch,
+            repo_name=repo_name,
+            host_config=host_config,
+            credential_reference=credential_reference,
+            on_stage=on_stage,
+        )
+
+
+def _hook_config(
+    fake: FakeSandboxLauncher,
+    hook: ManagedCredentialHook | None,
+) -> ManagedSandboxConfig:
+    """
+    Build an injected config that also wires *hook* onto ``credential_hook``.
+
+    :param fake: The launcher every launch should use.
+    :param hook: The credential hook to configure, or ``None`` for the
+        default (no-hook) behavior.
+    :returns: A ready :class:`ManagedSandboxConfig`.
+    """
+    return ManagedSandboxConfig(
+        server_url="https://srv.example.com",
+        launcher_factory=lambda: fake,
+        token_ttl_s=3600,
+        credential_hook=hook,
+    )
+
+
+def _online_register(host_store: HostStore) -> Callable[[HostStartInvocation], None]:
+    """Return an ``on_host_start`` that brings the host online via the store."""
+
+    def _register(invocation: HostStartInvocation) -> None:
+        host_store.upsert_on_connect(
+            host_id=invocation.host_id,
+            name=invocation.host_name,
+            user_id=_OWNER,
+        )
+
+    return _register
+
+
+def test_launch_context_is_immutable() -> None:
+    """
+    The launch identity handed to a hook is frozen — a hook cannot mutate the
+    owner/host/session it is resolving credentials for mid-resolution.
+    """
+    context = ManagedLaunchContext(owner=_OWNER, host_id="h1", host_name="managed-h1")
+    with pytest.raises(dataclasses.FrozenInstanceError):
+        context.owner = "mallory@example.com"  # type: ignore[misc]
+
+
+def test_credential_lease_repr_redacts_secret() -> None:
+    """
+    The base lease repr reflects only the class name + non-secret reference —
+    a subclass that stashes raw credential material still reprs safely, so the
+    managed-launch layer can log leases on error paths without leaking.
+    """
+    lease = _FakeCredentialLease(reference="k8s-secret-xyz", secret="TOP-SECRET-VALUE")
+    rendered = repr(lease)
+    assert "TOP-SECRET-VALUE" not in rendered
+    assert "k8s-secret-xyz" in rendered
+    assert rendered == "_FakeCredentialLease(reference='k8s-secret-xyz')"
+
+
+async def test_default_lease_release_is_noop() -> None:
+    """
+    A lease that does not override ``release`` inherits a concrete no-op — an
+    addon whose credentials need no teardown need not implement cleanup.
+    """
+
+    class _MinimalLease(ManagedCredentialLease):
+        @property
+        def reference(self) -> str | None:
+            return None
+
+    # Must be awaitable and must not raise (idempotent no-op contract).
+    await _MinimalLease().release()
+
+
+async def test_launch_without_hook_passes_no_credential_reference(db_uri: str) -> None:
+    """
+    No-hook compatibility: with ``credential_hook`` unset the launch behaves
+    exactly as before — the launcher's ``start_host`` receives no credential
+    reference (``None``), and nothing is torn down.
+    """
+    host_store = HostStore(db_uri)
+    fake = _CredentialRefRecordingLauncher(on_host_start=_online_register(host_store))
+
+    result = await launch_managed_host(
+        config=_hook_config(fake, None),
+        owner=_OWNER,
+        host_store=host_store,
+    )
+
+    assert fake.credential_references == [None]
+    host = host_store.get_host(result.host_id)
+    assert host is not None and host.status == "online"
+    assert fake.terminated == []
+
+
+async def test_launch_invokes_hook_once_with_full_context(db_uri: str) -> None:
+    """
+    A first launch consults the hook EXACTLY ONCE and hands it the complete
+    launch identity: owner, the freshly minted host id/name, the session id
+    threaded from the caller, and the repository coordinates.
+    """
+    host_store = HostStore(db_uri)
+    fake = FakeSandboxLauncher(on_host_start=_online_register(host_store))
+    hook = _FakeCredentialHook()
+    repo = parse_repo_workspace("https://github.com/org/repo#release-1.2")
+
+    result = await launch_managed_host(
+        config=_hook_config(fake, hook),
+        owner=_OWNER,
+        host_store=host_store,
+        repo=repo,
+        session_id="conv_ctx123",
+    )
+
+    assert len(hook.contexts) == 1
+    context = hook.contexts[0]
+    assert context.owner == _OWNER
+    assert context.host_id == result.host_id
+    assert context.host_name == fake.host_starts[0].host_name
+    assert context.session_id == "conv_ctx123"
+    assert context.repo_url == "https://github.com/org/repo"
+    assert context.repo_branch == "release-1.2"
+    assert context.repo_name == "repo"
+
+
+async def test_launch_without_session_id_leaves_context_session_none(db_uri: str) -> None:
+    """
+    When no session id is available at the launch boundary the context's
+    ``session_id`` is ``None`` — never fabricated.
+    """
+    host_store = HostStore(db_uri)
+    fake = FakeSandboxLauncher(on_host_start=_online_register(host_store))
+    hook = _FakeCredentialHook()
+
+    await launch_managed_host(
+        config=_hook_config(fake, hook),
+        owner=_OWNER,
+        host_store=host_store,
+    )
+
+    assert hook.contexts[0].session_id is None
+    assert hook.contexts[0].repo_url is None
+
+
+async def test_launch_exposes_lease_reference_to_start_host(db_uri: str) -> None:
+    """
+    The resolved lease's NON-SECRET reference is exposed to launcher startup —
+    the generic seam a future provider (e.g. the Kubernetes envFrom Secret)
+    consumes.
+    """
+    host_store = HostStore(db_uri)
+    fake = _CredentialRefRecordingLauncher(on_host_start=_online_register(host_store))
+    lease = _FakeCredentialLease(reference="managed-cred-xyz")
+    hook = _FakeCredentialHook(lease)
+
+    await launch_managed_host(
+        config=_hook_config(fake, hook),
+        owner=_OWNER,
+        host_store=host_store,
+    )
+
+    assert fake.credential_references == ["managed-cred-xyz"]
+    # Success path: the lease is NOT released by this layer (its steady-state
+    # teardown is future work, documented on the contract).
+    assert lease.release_calls == 0
+
+
+async def test_relaunch_invokes_hook_with_durable_identity(db_uri: str) -> None:
+    """
+    A relaunch resolves credentials for the SAME durable host identity: the
+    context carries the unchanged host id/name/owner and the relaunch's
+    session id, so a per-user hook resolves the right owner's credentials for
+    the new sandbox generation.
+    """
+    host_store = HostStore(db_uri)
+    fake = FakeSandboxLauncher(on_host_start=_online_register(host_store))
+    hook = _FakeCredentialHook()
+    config = _hook_config(fake, hook)
+    first = await launch_managed_host(
+        config=config, owner=_OWNER, host_store=host_store, session_id="conv_relaunch"
+    )
+    gen1 = host_store.get_host(first.host_id)
+    assert gen1 is not None
+
+    await relaunch_managed_host(
+        config=config, host=gen1, host_store=host_store, session_id="conv_relaunch"
+    )
+
+    # Once for the first launch, once for the relaunch.
+    assert len(hook.contexts) == 2
+    relaunch_context = hook.contexts[1]
+    assert relaunch_context.host_id == first.host_id
+    assert relaunch_context.host_name == gen1.name
+    assert relaunch_context.owner == _OWNER
+    assert relaunch_context.session_id == "conv_relaunch"
+
+
+async def test_hook_failure_aborts_launch_and_tears_down_sandbox(db_uri: str) -> None:
+    """
+    A hook that cannot resolve credentials aborts the launch through the same
+    cleanup any post-provision failure takes: the sandbox is terminated, the
+    pre-registered host row (and its armed token) is deleted, and a 502 is
+    surfaced. The host never starts — the credentials were never in place.
+    """
+    host_store = HostStore(db_uri)
+    fake = FakeSandboxLauncher(on_host_start=_online_register(host_store))
+    hook = _FakeCredentialHook(fail=True)
+
+    with pytest.raises(HTTPException) as exc:
+        await launch_managed_host(
+            config=_hook_config(fake, hook),
+            owner=_OWNER,
+            host_store=host_store,
+        )
+
+    assert exc.value.status_code == 502
+    assert "credential resolution failed" in exc.value.detail
+    # Provisioned, then torn down: no paid compute leaks past the failed acquire.
+    assert fake.terminated == ["sb-fake-1"]
+    # The host never started (acquire runs before start_host).
+    assert fake.host_starts == []
+    assert host_store.list_hosts(_OWNER) == []
+
+
+async def test_start_host_failure_after_acquire_releases_lease(db_uri: str) -> None:
+    """
+    When the launch fails AFTER the lease was acquired (the in-sandbox host
+    start errors), this layer honours its one cleanup obligation: it releases
+    the lease exactly once, then tears the sandbox down and deletes the row.
+    """
+    host_store = HostStore(db_uri)
+    fake = FakeSandboxLauncher(fail_on_host_start=True)
+    lease = _FakeCredentialLease()
+    hook = _FakeCredentialHook(lease)
+
+    with pytest.raises(HTTPException) as exc:
+        await launch_managed_host(
+            config=_hook_config(fake, hook),
+            owner=_OWNER,
+            host_store=host_store,
+        )
+
+    assert exc.value.status_code == 502
+    assert lease.release_calls == 1
+    assert fake.terminated == ["sb-fake-1"]
+    assert host_store.list_hosts(_OWNER) == []
+
+
+async def test_relaunch_start_host_failure_releases_lease_keeps_row(db_uri: str) -> None:
+    """
+    A relaunch whose host start fails after acquiring the new generation's
+    lease releases that lease, but keeps the durable host row (only the new
+    sandbox is torn down and its token revoked) — the session stays
+    relaunchable.
+    """
+    host_store = HostStore(db_uri)
+    fake = FakeSandboxLauncher(on_host_start=_online_register(host_store))
+    hook = _FakeCredentialHook()
+    config = _hook_config(fake, hook)
+    first = await launch_managed_host(config=config, owner=_OWNER, host_store=host_store)
+    gen1 = host_store.get_host(first.host_id)
+    assert gen1 is not None
+
+    # Swap in a fresh lease for the relaunch so its release is unambiguous.
+    relaunch_lease = _FakeCredentialLease(reference="managed-cred-gen2")
+    hook_gen2 = _FakeCredentialHook(relaunch_lease)
+    config_gen2 = _hook_config(fake, hook_gen2)
+    fake.fail_on_host_start = True
+
+    with pytest.raises(HTTPException) as exc:
+        await relaunch_managed_host(config=config_gen2, host=gen1, host_store=host_store)
+
+    assert exc.value.status_code == 502
+    assert relaunch_lease.release_calls == 1
+    # Durable row survives the failed relaunch.
+    assert host_store.get_host(first.host_id) is not None

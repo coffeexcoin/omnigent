@@ -1071,6 +1071,7 @@ class KubernetesSandboxLauncher(SandboxLauncher):
         repo_branch: str | None = None,
         repo_name: str | None = None,
         host_config: dict[str, object] | None = None,
+        credential_reference: str | None = None,
         on_stage: Callable[[str], None] | None = None,
     ) -> str:
         """
@@ -1098,6 +1099,14 @@ class KubernetesSandboxLauncher(SandboxLauncher):
         :param host_config: Deployment-supplied ``~/.omnigent/config.yaml``
             content the init container merges in before the host starts, or
             ``None``.
+        :param credential_reference: Non-secret handle to per-launch,
+            owner-scoped credentials a server-side credential hook resolved
+            (e.g. the name of a Secret the hook created), or ``None`` when no
+            hook is configured. Accepted here so the generic seam reaches this
+            entrypoint-as-host provider, but NOT yet consumed: projecting such
+            a per-launch Secret via ``envFrom`` (alongside the static
+            deployment-wide ``sandbox.kubernetes.secret_name``) is a later
+            change. Never a secret value.
         :param on_stage: Progress observer; invoked with ``"starting"``.
         :returns: The absolute in-sandbox workspace path (the cloned repository
             directory when *repo_url* is set).
