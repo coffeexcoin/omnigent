@@ -1,0 +1,133 @@
+# Fork-only continuous publish of the server image for GitOps deploys.
+#
+# Upstream's oss-publish-images.yml is gated to `omnigent-ai/omnigent` and only
+# builds on v* tags + the nightly schedule, so it is inert here and never
+# produces an image this fork's cluster can track. This workflow fills that gap
+# and is deliberately kept separate — do not fold it into the upstream one, so
+# merges from upstream stay conflict-free.
+#
+# Publishes ghcr.io/coffeexcoin/omnigent-server:
+#   :main          floating tag on main HEAD. Argo CD Image Updater watches this
+#                  tag and pins the running workload to the resolved digest.
+#   :sha-<short>   immutable per-commit pin, for rollbacks and for correlating a
+#                  running digest back to a commit.
+#
+# Single-arch linux/amd64 only: the target Talos cluster is amd64, and adding an
+# arm64 leg would mean QEMU emulation (roughly doubles build time) for an image
+# nothing pulls. Add `platforms:` back if an arm64 node ever joins.
+#
+# First run creates the GHCR package PRIVATE. Either flip it to public in the
+# package settings, or give the cluster an imagePullSecret — cannot be done here.
+name: Publish server image (fork)
+
+on:
+  push:
+    branches: [main]
+    # Only build when something that actually lands in the image changes.
+    # Mirrors docker-build.yml's PR filter (web/** included — the image bakes
+    # the SPA, so a web-only change can still alter or break the image).
+    paths:
+      - 'deploy/docker/Dockerfile'
+      - 'deploy/docker/entrypoint.py'
+      - 'omnigent/**'
+      - 'web/**'
+      - 'sdks/**'
+      - 'pyproject.toml'
+      - 'setup.py'
+      - 'uv.lock'
+      - 'web/package-lock.json'
+      - '.github/workflows/fork-publish-server-image.yml'
+  # Manual rebuild of the checked-out ref (e.g. after flipping package
+  # visibility, or to republish without an empty commit).
+  workflow_dispatch:
+
+# Read-only at the top level; the push scope lives on the job below.
+permissions:
+  contents: read
+
+concurrency:
+  # Key by ref, not SHA: on a burst of merges only the newest commit matters,
+  # since :main must end up pointing at main HEAD. Cancelling the stale build
+  # also removes the race where an older build finishes last and moves :main
+  # backwards.
+  group: fork-publish-server-image-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build-and-push:
+    name: Build and push server image
+    # Gated to this fork; inert if this file is ever merged upstream or into
+    # another fork, where it would push to a package that doesn't exist.
+    if: github.repository == 'coffeexcoin/omnigent'
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    permissions:
+      contents: read
+      packages: write # push to GHCR via GITHUB_TOKEN
+    steps:
+      - name: Checkout
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0  # v7.0.0
+
+      - name: Set up Buildx
+        uses: docker/setup-buildx-action@d7f5e7f509e45cec5c76c4d5afdd7de93d0b3df5  # v4.1.0
+
+      - name: Log in to GHCR
+        uses: docker/login-action@650006c6eb7dba73a995cc03b0b2d7f5ca915bee  # v4.2.0
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      # IMAGE is a literal and SHORT_SHA comes from git, so nothing
+      # attacker-controlled (branch/tag names, dispatch inputs) reaches the shell.
+      - name: Compute image tags
+        id: tags
+        run: |
+          set -euo pipefail
+          IMAGE="ghcr.io/coffeexcoin/omnigent-server"
+          SHORT_SHA=$(git rev-parse --short HEAD)
+          echo "image=${IMAGE}" >> "$GITHUB_OUTPUT"
+          echo "tags=${IMAGE}:main,${IMAGE}:sha-${SHORT_SHA}" >> "$GITHUB_OUTPUT"
+
+      # Default (`runtime`) target = the server image. No build-args: the
+      # Dockerfile ARGs already default to the public registries.
+      - name: Build and push
+        id: build
+        uses: docker/build-push-action@f9f3042f7e2789586610d6e8b85c8f03e5195baf  # v7.2.0
+        with:
+          context: .
+          file: deploy/docker/Dockerfile
+          push: true
+          platforms: linux/amd64
+          tags: ${{ steps.tags.outputs.tags }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+          provenance: false
+          sbom: false
+
+      # Smoke the exact digest that was pushed, not a tag — a tag could have
+      # been moved by a concurrent build between push and pull. `omnigent --help`
+      # exercises the venv, the editable installs under /build and the console
+      # script, which is what catches a broken image.
+      - name: CLI smoke (pushed digest)
+        env:
+          IMAGE_REF: ${{ steps.tags.outputs.image }}@${{ steps.build.outputs.digest }}
+        run: |
+          set -euo pipefail
+          echo "smoking ${IMAGE_REF}"
+          docker run --rm --pull=always "${IMAGE_REF}" omnigent --help
+
+      - name: Summary
+        env:
+          IMAGE: ${{ steps.tags.outputs.image }}
+          TAGS: ${{ steps.tags.outputs.tags }}
+          DIGEST: ${{ steps.build.outputs.digest }}
+        run: |
+          set -euo pipefail
+          {
+            echo "### Published"
+            echo ""
+            echo "- tags: \`${TAGS}\`"
+            echo "- digest: \`${DIGEST}\`"
+            echo "- pull: \`${IMAGE}@${DIGEST}\`"
+          } >> "$GITHUB_STEP_SUMMARY"
