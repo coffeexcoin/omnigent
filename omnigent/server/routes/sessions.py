@@ -105,6 +105,7 @@ from omnigent.native_coding_agents import (
     native_coding_agent_for_terminal_name,
     native_coding_agent_for_wrapper_label,
 )
+from omnigent.policies.schema import validate_actor_context
 from omnigent.policies.types import (
     ElicitationRequest,
     EvaluationContext,
@@ -1279,13 +1280,6 @@ class _PendingPolicyAskWrites:
 _pending_policy_ask_writes: cachetools.LRUCache[str, _PendingPolicyAskWrites] = (
     cachetools.LRUCache(maxsize=512)
 )
-
-# Label key used to persist the turn-initiating human's identity on the
-# conversation row.  Written at _forward_event_to_runner time so any
-# server replica can read it back when the runner calls /policies/evaluate
-# or /mcp (tools/call).
-_TURN_ACTOR_LABEL = "omnigent.turn_actor"
-
 
 # (conversation_id, deciding_policy) -> lock serializing native ASK gates.
 # When an agent fires several tool calls in parallel, each spawns its own
@@ -12950,25 +12944,6 @@ def _reject_reserved_cost_control_label_seed(labels: dict[str, str]) -> None:
         )
 
 
-def _reject_server_reserved_label_seed(labels: dict[str, str] | None) -> None:
-    """
-    Reject a client-supplied label map that touches server-internal keys.
-
-    Keys in this set are written exclusively by server internals and must
-    not be client-settable — doing so would let callers forge security-
-    critical metadata (e.g. the policy-evaluation actor identity).
-
-    :param labels: The client-supplied label mapping, or ``None``.
-    :raises OmnigentError: 400 when any reserved key is present.
-    """
-    if not labels or _TURN_ACTOR_LABEL not in labels:
-        return
-    raise OmnigentError(
-        f"label {_TURN_ACTOR_LABEL!r} is server-internal and cannot be set by clients",
-        code=ErrorCode.INVALID_INPUT,
-    )
-
-
 def _require_cost_control_label_authority(
     *,
     reserved_keys: Sequence[str],
@@ -13024,6 +12999,7 @@ def _validated_runner_actor(
     tunnel_token: str | None,
     bound_runner_id: str | None,
     allowed_tunnel_tokens: frozenset[str] | None,
+    require_runner_proof: bool,
 ) -> dict[str, str] | None:
     """Validate actor context forwarded by the session's bound runner.
 
@@ -13031,38 +13007,27 @@ def _validated_runner_actor(
     authorize a caller-supplied actor override, because shared-session runners
     use a service bearer while forwarding the human who started the turn.
     The separate tunnel binding token supplies that runner proof.
+    Local single-user mode trusts its loopback runner without a binding token.
 
     :param raw_actor: Optional JSON ``actor`` value from the request body.
     :param tunnel_token: Runner tunnel binding token request header.
     :param bound_runner_id: Runner currently bound to the session.
     :param allowed_tunnel_tokens: Optional managed-pool token allow-list.
+    :param require_runner_proof: Whether actor overrides require tunnel proof.
     :returns: A validated actor, or ``None`` when no actor was supplied.
     :raises OmnigentError: 400 for malformed actor data, or 403 when an
         untrusted caller attempts to override actor identity.
     """
-    if raw_actor is None:
+    try:
+        actor = validate_actor_context(raw_actor)
+    except ValueError as exc:
+        raise OmnigentError(str(exc), code=ErrorCode.INVALID_INPUT) from exc
+    if actor is None:
         return None
-    if not isinstance(raw_actor, dict):
-        raise OmnigentError("actor must be a JSON object", code=ErrorCode.INVALID_INPUT)
-    unknown_keys = set(raw_actor) - {"run_as", "client_id"}
-    if unknown_keys:
-        keys = ", ".join(sorted(str(key) for key in unknown_keys))
-        raise OmnigentError(
-            f"actor contains unsupported fields: {keys}", code=ErrorCode.INVALID_INPUT
-        )
-    if not raw_actor:
-        raise OmnigentError("actor must not be empty", code=ErrorCode.INVALID_INPUT)
-    actor: dict[str, str] = {}
-    for key in ("run_as", "client_id"):
-        value = raw_actor.get(key)
-        if value is None:
-            continue
-        if not isinstance(value, str) or not value.strip() or len(value) > 320:
-            raise OmnigentError(
-                f"actor.{key} must be a non-empty string of at most 320 characters",
-                code=ErrorCode.INVALID_INPUT,
-            )
-        actor[key] = value.strip()
+    run_as = actor.get("run_as")
+    assert isinstance(run_as, str)  # validated by validate_actor_context
+    if not require_runner_proof:
+        return {"run_as": run_as}
 
     token = (tunnel_token or "").strip()
     trusted = bool(
@@ -13077,7 +13042,7 @@ def _validated_runner_actor(
             "only the session's bound runner may forward actor context",
             code=ErrorCode.FORBIDDEN,
         )
-    return actor
+    return {"run_as": run_as}
 
 
 async def _create_session_from_existing_agent(
@@ -13128,7 +13093,6 @@ async def _create_session_from_existing_agent(
         fails authorization.
     """
     _reject_reserved_cost_control_label_seed(body.labels)
-    _reject_server_reserved_label_seed(body.labels)
 
     agent = await validate_session_agent(
         user_id=user_id,
@@ -15352,7 +15316,6 @@ def create_sessions_router(
             raise HTTPException(status_code=422, detail=[_multipart_missing_detail("bundle")])
         parsed_metadata = _parse_session_create_metadata(metadata)
         _reject_reserved_cost_control_label_seed(parsed_metadata.labels)
-        _reject_server_reserved_label_seed(parsed_metadata.labels)
 
         inherited_runner_id: str | None = None
         if parsed_metadata.parent_session_id is not None:
@@ -16270,7 +16233,6 @@ def create_sessions_router(
                     code=ErrorCode.FORBIDDEN,
                 )
         if body.labels:
-            _reject_server_reserved_label_seed(body.labels)
             # Advisor-owned cost_control.* labels are written only by the
             # session's bound runner; gate them on runner proof BEFORE any
             # store mutation so a rejected request leaves the session untouched.
@@ -17481,6 +17443,7 @@ def create_sessions_router(
             tunnel_token=request.headers.get(RUNNER_TUNNEL_TOKEN_HEADER),
             bound_runner_id=conv.runner_id,
             allowed_tunnel_tokens=runner_tunnel_tokens,
+            require_runner_proof=permission_store is not None or user_id is not None,
         )
         # Dedup the native request-phase gate. A native session's
         # ``UserPromptSubmit`` hook posts ``PHASE_REQUEST`` here for *every*
@@ -22371,6 +22334,7 @@ def create_sessions_router(
                 tunnel_token=request.headers.get(RUNNER_TUNNEL_TOKEN_HEADER),
                 bound_runner_id=conv.runner_id,
                 allowed_tunnel_tokens=runner_tunnel_tokens,
+                require_runner_proof=permission_store is not None or user_id is not None,
             )
             return await _handle_mcp_tools_call(
                 rpc_id,

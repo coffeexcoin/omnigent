@@ -28,6 +28,7 @@ from typing import Any
 
 import httpx
 import pytest
+from starlette.responses import JSONResponse
 
 from omnigent.runner.identity import RUNNER_TUNNEL_TOKEN_HEADER, token_bound_runner_id
 from omnigent.runtime import get_caps, session_stream
@@ -565,6 +566,124 @@ async def test_evaluate_carried_turn_actor_overrides_request_user_id(
         "carried turn actor should override the request user_id"
     )
     assert body["reason"] == "Blocked user"
+
+
+async def test_evaluate_accepts_runner_actor_in_single_user_mode(
+    client: httpx.AsyncClient,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A loopback runner callback carries turn authority without a tunnel token."""
+    policy = FunctionPolicySpec(
+        name="admin__deny_blocked_actor",
+        on=None,
+        function=FunctionRef(path=f"{__name__}._deny_blocked_actor"),
+    )
+    original_caps = get_caps()
+    monkeypatch.setattr(
+        "omnigent.server.routes.sessions.get_caps",
+        lambda: RuntimeCaps(
+            execution_timeout=original_caps.execution_timeout,
+            default_policies=[policy],
+        ),
+    )
+    monkeypatch.setattr(
+        "omnigent.server.routes.sessions._get_user_id",
+        lambda _req, _auth: None,
+    )
+
+    agent = await create_test_agent(client)
+    session_id = await _create_session(client, agent["id"])
+    payload = _tool_call_request("Read")
+    payload["actor"] = {"run_as": "blocked@test.com"}
+
+    resp = await client.post(
+        f"/v1/sessions/{session_id}/policies/evaluate",
+        json=payload,
+    )
+
+    assert resp.status_code == 200
+    assert resp.json()["result"] == "POLICY_ACTION_DENY"
+
+
+async def test_mcp_accepts_runner_actor_in_single_user_mode(
+    client: httpx.AsyncClient,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A loopback runner MCP callback preserves its turn actor without a token."""
+    captured: dict[str, object] = {}
+
+    async def _capture_call(*_args: object, **kwargs: object) -> JSONResponse:
+        captured.update(kwargs)
+        return JSONResponse({"jsonrpc": "2.0", "id": 1, "result": {}})
+
+    monkeypatch.setattr(sessions_routes, "_handle_mcp_tools_call", _capture_call)
+    agent = await create_test_agent(client)
+    session_id = await _create_session(client, agent["id"])
+
+    resp = await client.post(
+        f"/v1/sessions/{session_id}/mcp",
+        json={
+            "jsonrpc": "2.0",
+            "id": 1,
+            "method": "tools/call",
+            "params": {"name": "Read", "arguments": {}},
+            "actor": {"run_as": "alice@example.com"},
+        },
+    )
+
+    assert resp.status_code == 200
+    assert captured["actor"] == {"run_as": "alice@example.com"}
+
+
+async def test_mcp_rejects_malformed_runner_actor(client: httpx.AsyncClient) -> None:
+    """Malformed MCP callback actor payloads fail closed before dispatch."""
+    agent = await create_test_agent(client)
+    session_id = await _create_session(client, agent["id"])
+
+    resp = await client.post(
+        f"/v1/sessions/{session_id}/mcp",
+        json={
+            "jsonrpc": "2.0",
+            "id": 1,
+            "method": "tools/call",
+            "params": {"name": "Read", "arguments": {}},
+            "actor": {},
+        },
+    )
+
+    assert resp.status_code == 400
+    assert "actor" in resp.text
+
+
+@pytest.mark.parametrize(
+    "actor",
+    [
+        {},
+        {"run_as": ""},
+        {"run_as": "   "},
+        {"run_as": None},
+        {"run_as": 7},
+        {"run_as": "a" * 321},
+        {"run_as": "blocked@test.com", "role": "admin"},
+    ],
+)
+async def test_evaluate_rejects_malformed_runner_actor(
+    client: httpx.AsyncClient,
+    actor: object,
+) -> None:
+    """Malformed callback actor payloads fail closed before policy evaluation."""
+    agent = await create_test_agent(client)
+    session_id = await _create_session(client, agent["id"])
+    payload = _tool_call_request("Read")
+    payload["actor"] = actor
+
+    resp = await client.post(
+        f"/v1/sessions/{session_id}/policies/evaluate",
+        json=payload,
+    )
+
+    assert resp.status_code == 400
+    assert "actor" in resp.text
 
 
 async def test_evaluate_rejects_untrusted_top_level_actor(

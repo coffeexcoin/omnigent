@@ -58,7 +58,7 @@ from omnigent.llms.summarize import (
     extract_summary_text,
 )
 from omnigent.model_override import validate_model_override
-from omnigent.policies.schema import ActorContext
+from omnigent.policies.schema import ActorContext, validate_actor_context
 from omnigent.policies.types import FAIL_CLOSED_PHASES
 from omnigent.runner import pending_approvals
 from omnigent.runner.codex.goal import CodexGoalRunner
@@ -14508,7 +14508,7 @@ def create_runner_app(
                 or msg_body.get("has_mcp_servers") is True
             ),
             instructions=instructions,
-            actor=msg_body.get("actor"),
+            actor=validate_actor_context(msg_body.get("actor")),
         )
 
         harness_body: dict[str, Any] = {
@@ -15686,6 +15686,15 @@ def create_runner_app(
                 )
             message_body = dict(body)
             message_body["conversation_id"] = conversation_id
+            try:
+                actor = validate_actor_context(message_body.get("actor"))
+            except ValueError as exc:
+                return JSONResponse(
+                    status_code=400,
+                    content={"error": "invalid_request", "detail": str(exc)},
+                )
+            if actor is not None:
+                message_body["actor"] = actor
 
             # A new message means a turn is (about to be) in flight. Mark the
             # native session running now so a pane crash before the PTY
