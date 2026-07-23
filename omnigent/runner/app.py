@@ -31,6 +31,7 @@ if TYPE_CHECKING:
     # graph (they are imported lazily inside the codex-native helpers).
     from omnigent.claude_native import ClaudeNativeUcodeConfig
     from omnigent.codex_native_app_server import CodexAppServerClient
+    from omnigent.runner.credential_broker import AuditSink, CredentialProvider
     from omnigent.terminals.registry import TerminalListEntry
 
 import httpx
@@ -8177,6 +8178,8 @@ def create_runner_app(
     mcp_manager: Any | None = None,
     auth_token: str | None = None,
     auth_token_factory: Callable[[], str | None] | None = None,
+    credential_provider: CredentialProvider | None = None,
+    credential_audit_sink: AuditSink | None = None,
 ) -> FastAPI:
     """Build a fresh runner FastAPI app.
 
@@ -8212,6 +8215,10 @@ def create_runner_app(
     :param auth_token_factory: Refresh-capable server bearer factory owned by
         the runner process. Native terminal helpers reuse it instead of
         resolving host credentials again for every terminal launch.
+    :param credential_provider: Optional trusted provider for per-invocation
+        Git and GitHub CLI credentials. ``None`` leaves PATH unchanged.
+    :param credential_audit_sink: Optional secret-free audit callback invoked
+        for every authorized broker request.
     """
     import hmac
 
@@ -8223,6 +8230,69 @@ def create_runner_app(
     from omnigent.runtime import telemetry
 
     telemetry.instrument_fastapi_app(app)
+
+    credential_bridge = None
+    if credential_provider is not None:
+        from omnigent.runner.credential_broker import CredentialBrokerBridge
+
+        credential_bridge = CredentialBrokerBridge(
+            credential_provider,
+            audit_sink=credential_audit_sink,
+        )
+
+        async def _close_credential_bridge() -> None:
+            await credential_bridge.close()
+
+        app.router.add_event_handler("shutdown", _close_credential_bridge)
+    app.state.credential_broker = credential_bridge
+
+    async def _credential_wrapper_environment(
+        session_id: str,
+        base_env: Mapping[str, str] | None,
+    ) -> dict[str, str]:
+        """Start the broker and build secret-free wrapper environment values."""
+        if credential_bridge is None:
+            return {}
+        await credential_bridge.start()
+        source = dict(os.environ)
+        if base_env is not None:
+            source.update(base_env)
+        return credential_bridge.wrapper_environment(session_id, source)
+
+    async def _with_credential_wrappers(
+        session_id: str,
+        spawn_env: dict[str, str] | None,
+    ) -> dict[str, str] | None:
+        if credential_bridge is None:
+            return spawn_env
+        wrapped = dict(spawn_env or {})
+        wrapped.update(await _credential_wrapper_environment(session_id, spawn_env))
+        return wrapped
+
+    def _bind_credential_turn(
+        session_id: str,
+        actor: ActorContext | None,
+        raw_turn_id: object,
+    ) -> None:
+        if credential_bridge is None:
+            return
+        if actor is None:
+            credential_bridge.clear_turn(session_id)
+            return
+        from omnigent.runner.credential_broker import ActiveCredentialTurn
+
+        turn_id = (
+            raw_turn_id
+            if isinstance(raw_turn_id, str) and raw_turn_id
+            else f"turn_{uuid.uuid4().hex}"
+        )
+        credential_bridge.bind_turn(
+            ActiveCredentialTurn(
+                session_id=session_id,
+                turn_id=turn_id,
+                actor=actor.copy(),
+            )
+        )
 
     # Runner-side auth middleware.
     if auth_token is not None:
@@ -8694,6 +8764,8 @@ def create_runner_app(
             runner_workspace=runner_workspace,
             per_session_workspace=per_session_workspace,
         )
+    if credential_bridge is not None:
+        resource_registry.set_terminal_env_provider(_credential_wrapper_environment)
     app.state.session_resource_registry = resource_registry
 
     def _publish_terminal_activity(session_id: str, terminal_id: str) -> None:
@@ -9643,6 +9715,8 @@ def create_runner_app(
             harness_name = "runner-test-default"
             spawn_env = None
 
+        spawn_env = await _with_credential_wrappers(session_id, spawn_env)
+
         try:
             await process_manager.get_client(
                 session_id,
@@ -10583,6 +10657,9 @@ def create_runner_app(
             e.g. ``"conv_abc123"``.
         :returns: Deletion confirmation JSON.
         """
+        if credential_bridge is not None:
+            credential_bridge.revoke_session(session_id)
+
         # Cancel active turn before releasing harness.
         turn_task = _active_turns.pop(session_id, None)
         if turn_task is not None and isinstance(turn_task, asyncio.Task):
@@ -13646,6 +13723,11 @@ def create_runner_app(
         """
 
         _active_turns.pop(conv_id, None)
+        # Native proxy streams end after input injection; their terminal
+        # forwarders own the actual turn boundary and clear on idle/failed.
+        native_turn_continues = error is None and _is_native_harness(conv_id)
+        if credential_bridge is not None and not native_turn_continues:
+            credential_bridge.clear_turn(conv_id)
         # Turn ended: clear the live marker so a concurrent forward is skipped.
         _live_response_id.pop(conv_id, None)
         # Mirror the clear onto the process manager's in-flight map so the
@@ -14510,6 +14592,7 @@ def create_runner_app(
             instructions=instructions,
             actor=validate_actor_context(msg_body.get("actor")),
         )
+        _bind_credential_turn(conv, ctx.actor, msg_body.get("persisted_item_id"))
 
         harness_body: dict[str, Any] = {
             "type": "message",
@@ -14780,6 +14863,8 @@ def create_runner_app(
             # This teardown bypasses _on_proxy_stream_end, so clear the live
             # marker here too or the next turn's forward gate goes stale.
             _active_turns.pop(session_id, None)
+            if credential_bridge is not None:
+                credential_bridge.clear_turn(session_id)
             _live_response_id.pop(session_id, None)
             _publish_turn_status(session_id, "idle")
             raise
@@ -14986,6 +15071,8 @@ def create_runner_app(
                         )
                     finally:
                         _publish_terminal_pending(_publish_event, conv_id, False)
+
+        spawn_env = await _with_credential_wrappers(conv_id, spawn_env)
 
         try:
             client = await process_manager.get_client(conv_id, harness_name, env=spawn_env)
@@ -15890,6 +15977,11 @@ def create_runner_app(
                     # Streaming mode: return the SSE body synchronously
                     # so the executor can consume response.created,
                     # dispatch tool calls, and pair results inline.
+                    _bind_credential_turn(
+                        conversation_id,
+                        actor,
+                        message_body.get("persisted_item_id"),
+                    )
                     response = await _stream_message_to_harness(message_body, conversation_id)
                     if not isinstance(response, StreamingResponse):
                         _on_proxy_stream_end(
@@ -15985,6 +16077,8 @@ def create_runner_app(
                     allow_history_preview_fallback=False,
                 )
             if status in ("idle", "failed"):
+                if credential_bridge is not None:
+                    credential_bridge.clear_turn(conversation_id)
                 # Rebuild a lost / never-registered work entry from the snapshot
                 # first, so a reconnect-wiped map or a sys_session_create child
                 # still wakes the parent instead of being dropped.
