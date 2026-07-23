@@ -130,12 +130,17 @@ import time
 import uuid
 from collections.abc import Callable
 from dataclasses import dataclass
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Any
 
 import click
 from fastapi import HTTPException
 
 from omnigent.db.utils import now_epoch
+from omnigent.server.managed_credentials import (
+    ManagedCredentialHook,
+    ManagedCredentialLease,
+    ManagedLaunchContext,
+)
 from omnigent.stores.host_store import Host, HostStore
 
 if TYPE_CHECKING:
@@ -397,6 +402,14 @@ class ManagedSandboxConfig:
         Non-secret by design: credentials stay behind
         ``api_key_ref: env:VAR`` indirection, resolved inside the
         sandbox against its own environment.
+    :param credential_hook: Optional per-launch credential resolver an
+        embedding deployment injects to make each managed host act with
+        its owner's credentials (see
+        :mod:`omnigent.server.managed_credentials`). Consulted once per
+        launch, immediately before the in-sandbox host starts; its lease
+        reference is exposed to launcher startup. ``None`` (the default,
+        and the only value the YAML path produces) keeps the original
+        behavior — no credentials are resolved and no lease is acquired.
     """
 
     server_url: str
@@ -405,6 +418,7 @@ class ManagedSandboxConfig:
     managed_launch_supported: bool = True
     provider: str | None = None
     host_config: dict[str, object] | None = None
+    credential_hook: ManagedCredentialHook | None = None
 
 
 @dataclass
@@ -1847,6 +1861,7 @@ async def launch_managed_host(
     owner: str,
     host_store: HostStore,
     repo: RepoWorkspace | None = None,
+    session_id: str | None = None,
     on_stage: Callable[[str], None] | None = None,
 ) -> ManagedHostLaunch:
     """
@@ -1875,6 +1890,12 @@ async def launch_managed_host(
         host image's git credential helper when the sandbox env
         carries ``GIT_TOKEN`` (injected through Modal secrets — see
         deploy/modal/README.md "Git credentials").
+    :param session_id: Session/conversation this launch was kicked for,
+        e.g. ``"conv_abc123"``, threaded into the
+        :class:`~omnigent.server.managed_credentials.ManagedLaunchContext`
+        a configured credential hook resolves against. ``None`` when a
+        caller has no session in hand (the context's ``session_id`` is
+        then ``None`` — never fabricated).
     :param on_stage: Progress observer invoked as the launch pipeline
         advances, with the stage just entered: ``"cloning"`` (when
         *repo* is set) then ``"starting"``. May be called from a
@@ -1905,9 +1926,9 @@ async def launch_managed_host(
         launcher=launcher,
         config=config,
         host_store=host_store,
-        host_id=host_id,
-        host_name=host_name,
-        owner=owner,
+        context=_launch_context(
+            owner=owner, host_id=host_id, host_name=host_name, session_id=session_id, repo=repo
+        ),
         sandbox_id=sandbox_id,
         repo=repo,
         on_stage=on_stage,
@@ -1921,6 +1942,7 @@ async def relaunch_managed_host(
     host: Host,
     host_store: HostStore,
     repo: RepoWorkspace | None = None,
+    session_id: str | None = None,
     on_stage: Callable[[str], None] | None = None,
 ) -> ManagedHostLaunch:
     """
@@ -1948,6 +1970,9 @@ async def relaunch_managed_host(
     :param host_store: Persistent host registrations.
     :param repo: Repository to re-clone as the workspace, or ``None``
         for an empty workspace.
+    :param session_id: Session/conversation this relaunch was kicked
+        for, threaded into the credential hook's launch context; see
+        :func:`launch_managed_host`. ``None`` when unavailable.
     :param on_stage: Progress observer forwarded to
         :func:`_arm_and_start_host`; see :func:`launch_managed_host`.
         ``None`` disables progress reporting.
@@ -1981,9 +2006,13 @@ async def relaunch_managed_host(
         launcher=launcher,
         config=config,
         host_store=host_store,
-        host_id=host.host_id,
-        host_name=host.name,
-        owner=host.user_id,
+        context=_launch_context(
+            owner=host.user_id,
+            host_id=host.host_id,
+            host_name=host.name,
+            session_id=session_id,
+            repo=repo,
+        ),
         sandbox_id=sandbox_id,
         repo=repo,
         on_stage=on_stage,
@@ -1992,14 +2021,88 @@ async def relaunch_managed_host(
     return ManagedHostLaunch(host_id=host.host_id, workspace=workspace)
 
 
+def _launch_context(
+    *,
+    owner: str,
+    host_id: str,
+    host_name: str,
+    session_id: str | None,
+    repo: RepoWorkspace | None,
+) -> ManagedLaunchContext:
+    """
+    Assemble the immutable launch identity handed to a credential hook.
+
+    Unpacks *repo* into the context's flat repository coordinates so the
+    hook contract carries no server ``RepoWorkspace`` dependency.
+
+    :param owner: User the managed host acts for.
+    :param host_id: Server-chosen host identity.
+    :param host_name: Server-chosen host display name.
+    :param session_id: Session/conversation the launch was kicked for,
+        or ``None`` when unavailable (never fabricated).
+    :param repo: Parsed repository workspace, or ``None`` for an empty
+        workspace.
+    :returns: The populated :class:`ManagedLaunchContext`.
+    """
+    return ManagedLaunchContext(
+        owner=owner,
+        host_id=host_id,
+        host_name=host_name,
+        session_id=session_id,
+        repo_url=repo.url if repo is not None else None,
+        repo_branch=repo.branch if repo is not None else None,
+        repo_name=repo.repo_name if repo is not None else None,
+    )
+
+
+async def _acquire_credential_lease(
+    config: ManagedSandboxConfig,
+    context: ManagedLaunchContext,
+) -> ManagedCredentialLease | None:
+    """
+    Resolve the per-launch credential lease, or ``None`` when no hook.
+
+    Called inside the arm/start try-block so a hook that raises aborts
+    the launch through the same cleanup path any post-provision failure
+    takes (sandbox torn down, token revoked).
+
+    :param config: The deployment's sandbox config.
+    :param context: The immutable launch identity to resolve against.
+    :returns: The acquired lease, or ``None`` when
+        ``config.credential_hook`` is unset (default behavior).
+    """
+    if config.credential_hook is None:
+        return None
+    return await config.credential_hook.acquire(context)
+
+
+async def _release_lease_best_effort(lease: ManagedCredentialLease | None) -> None:
+    """
+    Release a lease on the launch-failure path, swallowing any error.
+
+    The lease contract makes :meth:`release` idempotent and non-raising,
+    but this is a cleanup boundary: a misbehaving hook must not mask the
+    launch failure being handled, so any escape is logged, not raised.
+
+    :param lease: The lease acquired for the failed launch, or ``None``
+        when no hook was configured / no lease was acquired.
+    """
+    if lease is None:
+        return
+    try:
+        await lease.release()
+    except Exception:  # noqa: BLE001 — cleanup boundary: a hook's release must
+        # never mask the launch failure being handled. The lease repr is
+        # redacted (no secrets), so it is safe to log.
+        _logger.warning("Failed to release managed credential lease %r", lease, exc_info=True)
+
+
 async def _arm_and_start_host(
     *,
     launcher: SandboxLauncher,
     config: ManagedSandboxConfig,
     host_store: HostStore,
-    host_id: str,
-    host_name: str,
-    owner: str,
+    context: ManagedLaunchContext,
     sandbox_id: str,
     repo: RepoWorkspace | None = None,
     on_stage: Callable[[str], None] | None = None,
@@ -2009,23 +2112,23 @@ async def _arm_and_start_host(
     Arm the credential, start the in-sandbox host, and await its
     registration — tearing the sandbox down on any failure.
 
-    The credential is registered BEFORE the host process starts, so
-    the token is resolvable by the time the host first dials the
-    tunnel. A failure in any later step terminates the sandbox and
-    revokes the armed token before re-raising — by deleting the host
-    row (first launch: the row would otherwise be an unusable picker
-    ghost) or, on a relaunch, by clearing the credential columns only
-    (the durable row keeps the session binding alive for a retry).
+    The launch token is registered BEFORE the host process starts, so
+    it is resolvable by the time the host first dials the tunnel; when a
+    :class:`~omnigent.server.managed_credentials.ManagedCredentialHook`
+    is configured, its per-launch lease is acquired in the same window
+    and its non-secret reference exposed to ``start_host``. A failure in
+    any later step releases that lease (best-effort), terminates the
+    sandbox, and revokes the armed token before re-raising — by deleting
+    the host row (first launch: the row would otherwise be an unusable
+    picker ghost) or, on a relaunch, by clearing the credential columns
+    only (the durable row keeps the session binding alive for a retry).
 
     :param launcher: The launcher holding the provisioned sandbox.
     :param config: The deployment's sandbox config.
     :param host_store: Persistent host registrations.
-    :param host_id: Server-chosen host identity, e.g.
-        ``"host_a1b2c3d4..."``.
-    :param host_name: Server-chosen host display name, e.g.
-        ``"managed-a1b2c3d4"``.
-    :param owner: User the managed host acts for, e.g.
-        ``"alice@example.com"``.
+    :param context: The immutable launch identity (owner, host id/name,
+        session id, repository coordinates) — carries the values a
+        configured credential hook resolves against.
     :param sandbox_id: The provisioned sandbox, e.g. ``"sb-a1b2c3"``.
     :param repo: Repository to clone as the workspace, or ``None``
         for an empty workspace.
@@ -2036,21 +2139,38 @@ async def _arm_and_start_host(
         cleanup terminates the new sandbox and revokes the token but
         keeps the host row. ``False`` (first launch) deletes the row.
     :returns: The absolute in-sandbox workspace path.
-    :raises HTTPException: 502 when cloning, host startup, or
-        registration fails.
+    :raises HTTPException: 502 when credential resolution, cloning,
+        host startup, or registration fails.
     """
+    host_id = context.host_id
     token = secrets.token_urlsafe(32)
     record = await asyncio.to_thread(
         host_store.register_managed_host,
         host_id=host_id,
-        name=host_name,
-        user_id=owner,
+        name=context.host_name,
+        user_id=context.owner,
         token=token,
         provider=launcher.provider,
         sandbox_id=sandbox_id,
         token_expires_at=now_epoch() + config.token_ttl_s,
     )
+    lease: ManagedCredentialLease | None = None
     try:
+        # Resolve per-launch credentials (no-op without a hook) before the host
+        # starts, so a configured lease's credentials are in place by the time
+        # the host authenticates. A raising hook aborts through the cleanup
+        # below, exactly like any other post-provision failure.
+        lease = await _acquire_credential_lease(config, context)
+        # host_config and credential_reference are passed only when set, so a
+        # deployment-injected launcher predating either parameter keeps
+        # launching unchanged. Only the lease's NON-SECRET reference crosses
+        # into the launcher (keeping this onboarding-layer call free of the
+        # server lease type, like repo_* / host_config).
+        optional_start_kwargs: dict[str, Any] = {}
+        if config.host_config is not None:
+            optional_start_kwargs["host_config"] = config.host_config
+        if lease is not None:
+            optional_start_kwargs["credential_reference"] = lease.reference
         # Uniform across providers: provision() fixed the sandbox id and the
         # token was armed against it above, so start_host starts the host with
         # a token that already resolves. The exec-model default execs in; the
@@ -2061,25 +2181,24 @@ async def _arm_and_start_host(
             sandbox_id,
             token=token,
             host_id=host_id,
-            host_name=host_name,
+            host_name=context.host_name,
             server_url=config.server_url,
             repo_url=repo.url if repo is not None else None,
             repo_branch=repo.branch if repo is not None else None,
             repo_name=repo.repo_name if repo is not None else None,
             on_stage=on_stage,
-            # Omitted entirely when unset: a deployment-injected launcher
-            # predating the host_config parameter must keep launching.
-            **({"host_config": config.host_config} if config.host_config is not None else {}),
+            **optional_start_kwargs,
         )
         await _wait_for_host_online(host_store, host_id)
     except Exception as exc:
-        # Broad on purpose: any post-provision failure — launcher CLI
-        # errors, provider SDK exceptions (e.g. Modal's
+        # Broad on purpose: any post-provision failure — a raising credential
+        # hook, launcher CLI errors, provider SDK exceptions (e.g. Modal's
         # SandboxTerminated), raw network errors from the in-sandbox
-        # exec — must tear down the sandbox and revoke the armed token,
-        # or the sandbox leaks running until the provider's lifetime
-        # cap. Cleanup-then-reraise at a system boundary, not a
+        # exec — must release the lease, tear down the sandbox, and revoke the
+        # armed token, or the sandbox leaks running until the provider's
+        # lifetime cap. Cleanup-then-reraise at a system boundary, not a
         # swallow: every path below re-raises as an HTTPException.
+        await _release_lease_best_effort(lease)
         if keep_host_on_failure:
             await _terminate_sandbox_best_effort(launcher, record)
             await asyncio.to_thread(host_store.revoke_launch_token, host_id)

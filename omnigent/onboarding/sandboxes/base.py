@@ -451,6 +451,7 @@ class SandboxLauncher(ABC):
         repo_branch: str | None = None,
         repo_name: str | None = None,
         host_config: dict[str, object] | None = None,
+        credential_reference: str | None = None,
         on_stage: Callable[[str], None] | None = None,
     ) -> str:
         """
@@ -491,6 +492,17 @@ class SandboxLauncher(ABC):
             launchers ``None`` still runs the cleanup so entries injected by a
             since-removed block don't outlive it — see
             :func:`render_host_config_write_command`.
+        :param credential_reference: Non-secret handle to per-launch
+            credentials a server-side credential hook resolved for the session
+            owner (e.g. the name of a provider Secret the hook created), or
+            ``None`` when no hook is configured. A primitive, not the server's
+            credential-lease object, so this onboarding-layer method carries no
+            server dependency — mirrors how ``repo_*`` and *host_config* cross
+            the boundary. The exec-model default has nothing to inject and
+            ignores it; a provider whose sandbox reads credentials from a named
+            provider object (e.g. the Kubernetes launcher's envFrom Secret) is
+            the intended consumer, wired in a later change. Never a secret
+            value, so it is safe to log.
         :param on_stage: Progress observer invoked with ``"cloning"`` before the
             clone (when *repo_url* is set) and ``"starting"`` before the host
             launches. Runs on this (worker) thread, so it must be thread-safe.

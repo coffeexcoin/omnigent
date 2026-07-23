@@ -6945,6 +6945,7 @@ async def _provision_managed_sandbox(
                 host=relaunch_host,
                 host_store=host_store,
                 repo=repo,
+                session_id=session_id,
                 on_stage=_on_stage,
             )
         return await launch_managed_host(
@@ -6952,6 +6953,7 @@ async def _provision_managed_sandbox(
             owner=owner,
             host_store=host_store,
             repo=repo,
+            session_id=session_id,
             on_stage=_on_stage,
         )
     except HTTPException as exc:
