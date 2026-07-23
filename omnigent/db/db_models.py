@@ -1323,6 +1323,11 @@ class SqlManagedCredentialLease(OmnigentBase):
     repo_branch: Mapped[str | None] = mapped_column(String(256), nullable=True)
     repo_name: Mapped[str | None] = mapped_column(String(256), nullable=True)
     reference: Mapped[str | None] = mapped_column(String(256), nullable=True)
+    credential_cleanup_required: Mapped[bool] = mapped_column(
+        Boolean,
+        nullable=False,
+        server_default=true(),
+    )
     # Random fencing identity only; this is not a provider credential or an
     # authentication token and grants no access outside lifecycle CAS updates.
     launch_owner_id: Mapped[str] = mapped_column(String(64), nullable=False)

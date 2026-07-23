@@ -300,6 +300,50 @@ def test_claim_renewal_only_extends_expiry(db_uri: str) -> None:
     assert persisted[0].claim_expires_at == initial_expiry + 120
 
 
+def test_active_claim_is_fenced_to_expected_sandbox_generation(db_uri: str) -> None:
+    """A stale teardown cannot claim credentials for a replacement sandbox."""
+    store = HostStore(db_uri)
+    _register(store, "sb-generation-1")
+    first = _record(store)
+    store.upsert_on_connect(_HOST_ID, _HOST_NAME, _USER_ID)
+    assert store.activate_credential_lease(
+        _HOST_ID,
+        first.generation,
+        "launch-owner-1",
+        expected_sandbox_id="sb-generation-1",
+    )
+
+    _register(store, "sb-generation-2")
+    second = _record(
+        store,
+        sandbox_id="sb-generation-2",
+        owner_token="launch-owner-2",
+    )
+    store.upsert_on_connect(_HOST_ID, _HOST_NAME, _USER_ID)
+    assert store.activate_credential_lease(
+        _HOST_ID,
+        second.generation,
+        "launch-owner-2",
+        expected_sandbox_id="sb-generation-2",
+    )
+
+    claimed = store.claim_active_credential_leases(
+        _HOST_ID,
+        claim_owner="stale-cleanup",
+        claim_expires_at=now_epoch() + 120,
+        expected_sandbox_id="sb-generation-1",
+    )
+
+    assert [(row.generation, row.sandbox_id) for row in claimed] == [
+        (first.generation, "sb-generation-1")
+    ]
+    persisted = {
+        row.generation: row.state
+        for row in store.list_credential_leases(_HOST_ID, include_released=True)
+    }
+    assert persisted == {first.generation: "retiring", second.generation: "active"}
+
+
 def test_reference_activation_and_release_are_cas_fenced(db_uri: str) -> None:
     """Wrong or stale owners cannot mutate another generation."""
     store = HostStore(db_uri)

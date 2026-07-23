@@ -793,6 +793,55 @@ def test_register_managed_host_relaunch_rotates_credential(db_uri: str) -> None:
     assert resolved.sandbox_id == "sb-gen2"
 
 
+def test_register_managed_host_requires_expected_predecessor(db_uri: str) -> None:
+    """A relaunch cannot resurrect a host removed by concurrent teardown."""
+    store = HostStore(db_uri)
+
+    with pytest.raises(RuntimeError, match="changed during relaunch"):
+        store.register_managed_host(
+            host_id="a687a760841c785578a03f4677f8db3c",
+            name="managed-m3",
+            user_id="alice@example.com",
+            token="generation-2-token",
+            provider="modal",
+            sandbox_id="sb-gen2",
+            token_expires_at=now_epoch() + 3600,
+            expected_sandbox_id="sb-gen1",
+        )
+
+    assert store.get_host("a687a760841c785578a03f4677f8db3c") is None
+
+
+def test_register_managed_host_require_absent_rejects_collision(db_uri: str) -> None:
+    """A first launch cannot overwrite an existing host identity."""
+    store = HostStore(db_uri)
+    store.register_managed_host(
+        host_id="a687a760841c785578a03f4677f8db3c",
+        name="managed-m3",
+        user_id="alice@example.com",
+        token="generation-1-token",
+        provider="modal",
+        sandbox_id="sb-gen1",
+        token_expires_at=now_epoch() + 3600,
+    )
+
+    with pytest.raises(RuntimeError, match="already exists"):
+        store.register_managed_host(
+            host_id="a687a760841c785578a03f4677f8db3c",
+            name="managed-m3",
+            user_id="alice@example.com",
+            token="generation-2-token",
+            provider="modal",
+            sandbox_id="sb-gen2",
+            token_expires_at=now_epoch() + 3600,
+            require_absent=True,
+        )
+
+    current = store.get_host("a687a760841c785578a03f4677f8db3c")
+    assert current is not None
+    assert current.sandbox_id == "sb-gen1"
+
+
 def test_managed_columns_survive_connect(db_uri: str) -> None:
     """
     The tunnel's ``upsert_on_connect`` (which fires when the sandbox

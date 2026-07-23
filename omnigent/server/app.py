@@ -56,7 +56,10 @@ from omnigent.server.background_session_titles import (
     BackgroundSessionTitleCoordinator,
     RunnerBackgroundTitleGenerator,
 )
-from omnigent.server.managed_hosts import ManagedSandboxConfig
+from omnigent.server.managed_hosts import (
+    ManagedSandboxConfig,
+    reconcile_managed_credential_leases,
+)
 from omnigent.server.mcp_pool import ServerMcpPool
 from omnigent.server.performance_metrics import (
     ServerMetricsOtelPublisher,
@@ -1493,6 +1496,15 @@ def create_app(
             # endpoints (see routes/scheduled_tasks.py); there is no startup
             # sweep and no periodic reconcile.
 
+        credential_recovery_task: asyncio.Task[None] | None = None
+        if sandbox_config is not None and host_store is not None:
+            # Recovery is intentionally detached from startup. Each provider
+            # operation is bounded, and the loop retries expired claims, so a
+            # hung control plane cannot keep the ASGI app unavailable.
+            credential_recovery_task = asyncio.create_task(
+                reconcile_managed_credential_leases(sandbox_config, host_store)
+            )
+
         try:
             yield
         finally:
@@ -1501,6 +1513,10 @@ def create_app(
             # cancel. Only the per-job scheduler holds timers that need stopping.
             if scheduled_task_scheduler is not None:
                 scheduled_task_scheduler.stop()
+            if credential_recovery_task is not None:
+                credential_recovery_task.cancel()
+                with suppress(asyncio.CancelledError):
+                    await credential_recovery_task
             metrics_publish_task.cancel()
             with suppress(asyncio.CancelledError):
                 await metrics_publish_task

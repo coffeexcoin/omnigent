@@ -12,7 +12,7 @@ from sqlalchemy.exc import IntegrityError
 from omnigent.db.utils import _build_alembic_config
 
 _PRIOR_REVISION = "c2d3e4f5a6b7"
-_THIS_REVISION = "d3e4f5a6b7c8"
+_THIS_REVISION = "e4f5a6b7c8d9"
 _TABLE = "managed_credential_leases"
 
 
@@ -83,6 +83,7 @@ def test_migration_schema_and_round_trip(tmp_path: Path) -> None:
             "repo_branch",
             "repo_name",
             "reference",
+            "credential_cleanup_required",
             "launch_owner_id",
             "owner_expires_at",
             "claim_owner",

@@ -107,6 +107,7 @@ class CredentialLeaseRecord:
     repo_branch: str | None
     repo_name: str | None
     reference: str | None
+    credential_cleanup_required: bool
     launch_owner_id: str
     owner_expires_at: int
     claim_owner: str | None
@@ -204,6 +205,7 @@ def _row_to_credential_lease(row: SqlManagedCredentialLease) -> CredentialLeaseR
         repo_branch=row.repo_branch,
         repo_name=row.repo_name,
         reference=row.reference,
+        credential_cleanup_required=row.credential_cleanup_required,
         launch_owner_id=row.launch_owner_id,
         owner_expires_at=row.owner_expires_at,
         claim_owner=row.claim_owner,
@@ -277,6 +279,7 @@ class HostStore:
         reference: str | None,
         owner_token: str,
         owner_expires_at: int | None = None,
+        credential_cleanup_required: bool = True,
     ) -> CredentialLeaseRecord:
         """Atomically reserve one pending generation before provider work.
 
@@ -310,6 +313,7 @@ class HostStore:
                     reference=reference,
                     owner_token=owner_token,
                     owner_expires_at=owner_expires_at,
+                    credential_cleanup_required=credential_cleanup_required,
                 )
             except IntegrityError as exc:
                 if not _is_credential_generation_conflict(exc) or time.monotonic() >= deadline:
@@ -334,6 +338,7 @@ class HostStore:
         reference: str | None,
         owner_token: str,
         owner_expires_at: int,
+        credential_cleanup_required: bool,
     ) -> CredentialLeaseRecord:
         """Insert one generation inside a single writer transaction."""
         with self._write_session() as session:
@@ -356,6 +361,7 @@ class HostStore:
                 repo_branch=repo_branch,
                 repo_name=repo_name,
                 reference=reference,
+                credential_cleanup_required=credential_cleanup_required,
                 launch_owner_id=owner_token,
                 owner_expires_at=owner_expires_at,
                 state=encode_managed_credential_lease_state("pending"),
@@ -495,17 +501,24 @@ class HostStore:
         *,
         claim_owner: str,
         claim_expires_at: int,
+        expected_sandbox_id: str | None = None,
     ) -> list[CredentialLeaseRecord]:
-        """Atomically claim active generations before relaunch or teardown."""
+        """Atomically claim matching active generations before cleanup."""
         workspace_id = current_workspace_id()
         now = now_epoch()
         if claim_expires_at <= now:
             return []
+        sandbox_binding = (
+            SqlManagedCredentialLease.sandbox_id.is_not(None)
+            if expected_sandbox_id is None
+            else SqlManagedCredentialLease.sandbox_id == expected_sandbox_id
+        )
         with self._write_session() as session:
             rows = session.scalars(
                 select(SqlManagedCredentialLease).where(
                     SqlManagedCredentialLease.workspace_id == workspace_id,
                     SqlManagedCredentialLease.host_id == host_id,
+                    sandbox_binding,
                     SqlManagedCredentialLease.state
                     == encode_managed_credential_lease_state("active"),
                 )
@@ -518,6 +531,7 @@ class HostStore:
                         SqlManagedCredentialLease.workspace_id == workspace_id,
                         SqlManagedCredentialLease.host_id == row.host_id,
                         SqlManagedCredentialLease.generation == row.generation,
+                        sandbox_binding,
                         SqlManagedCredentialLease.state
                         == encode_managed_credential_lease_state("active"),
                     )
@@ -1219,6 +1233,7 @@ class HostStore:
         sandbox_id: str,
         token_expires_at: int,
         expected_sandbox_id: str | None = None,
+        require_absent: bool = False,
     ) -> Host:
         """
         Pre-register a server-managed sandbox host with its credential.
@@ -1251,6 +1266,9 @@ class HostStore:
             ``"sb-a1b2c3"``.
         :param token_expires_at: Unix epoch seconds after which the
             token no longer authenticates.
+        :param expected_sandbox_id: Sandbox generation that must still own an
+            existing row. A missing row is a failed compare-and-swap.
+        :param require_absent: Require that no row exists for a first launch.
         :returns: The registered :class:`Host`.
         :raises ValueError: If a row for *host_id* exists under a
             DIFFERENT user_id — a relaunch may only re-credential a host
@@ -1265,6 +1283,8 @@ class HostStore:
                 .with_for_update()
             ).scalar_one_or_none()
             if existing is not None:
+                if require_absent:
+                    raise RuntimeError(f"managed host {host_id!r} already exists")
                 if existing.user_id != user_id:
                     # Fail closed (W2-class boundary): re-crediting a host
                     # row hands its launch token holder the row owner's
@@ -1287,6 +1307,8 @@ class HostStore:
                     existing.status = encode_host_status("offline")
                 existing.updated_at = now
                 return _row_to_host(existing)
+            if expected_sandbox_id is not None:
+                raise RuntimeError(f"managed host {host_id!r} changed during relaunch")
             row = SqlHost(
                 user_id=user_id,
                 name=name,
