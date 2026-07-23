@@ -15,9 +15,11 @@ import hashlib
 import hmac
 import json
 import logging
+import time
 from dataclasses import dataclass
+from typing import Any
 
-from sqlalchemy import Engine, select, update
+from sqlalchemy import Engine, and_, func, or_, select, update
 from sqlalchemy import delete as sql_delete
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
@@ -25,9 +27,15 @@ from sqlalchemy.orm import Session
 from omnigent.db.db_models import (
     SqlConversationMetadata,
     SqlHost,
+    SqlManagedCredentialLease,
     current_workspace_id,
 )
-from omnigent.db.enum_codecs import decode_host_status, encode_host_status
+from omnigent.db.enum_codecs import (
+    decode_host_status,
+    decode_managed_credential_lease_state,
+    encode_host_status,
+    encode_managed_credential_lease_state,
+)
 from omnigent.db.utils import get_or_create_engine, make_managed_session_maker, now_epoch
 from omnigent.harness_availability import HarnessAvailability, is_harness_availability
 
@@ -84,6 +92,30 @@ class Host:
     configured_harnesses: dict[str, HarnessAvailability] | None = None
 
 
+@dataclass(frozen=True)
+class CredentialLeaseRecord:
+    """Non-secret durable identity for one managed credential generation."""
+
+    host_id: str
+    generation: int
+    user_id: str
+    host_name: str
+    sandbox_provider: str
+    sandbox_id: str
+    session_id: str | None
+    repo_url: str | None
+    repo_branch: str | None
+    repo_name: str | None
+    reference: str | None
+    launch_owner_id: str
+    owner_expires_at: int
+    claim_owner: str | None
+    claim_expires_at: int | None
+    state: str
+    created_at: int
+    updated_at: int
+
+
 def host_is_live(host: Host, now: int | None = None) -> bool:
     """
     Return whether a :class:`Host` is online and recently seen.
@@ -106,6 +138,11 @@ def host_is_live(host: Host, now: int | None = None) -> bool:
 
 
 _logger = logging.getLogger(__name__)
+
+
+def _rowcount(result: Any) -> int:
+    """Return affected rows for SQLAlchemy DML results."""
+    return int(getattr(result, "rowcount", 0))
 
 
 def _parse_configured_harnesses(raw: str | None) -> dict[str, HarnessAvailability] | None:
@@ -153,6 +190,43 @@ def _row_to_host(row: SqlHost) -> Host:
     )
 
 
+def _row_to_credential_lease(row: SqlManagedCredentialLease) -> CredentialLeaseRecord:
+    """Convert a persisted lease row to its non-secret store entity."""
+    return CredentialLeaseRecord(
+        host_id=row.host_id,
+        generation=row.generation,
+        user_id=row.user_id,
+        host_name=row.host_name,
+        sandbox_provider=row.sandbox_provider,
+        sandbox_id=row.sandbox_id,
+        session_id=row.session_id,
+        repo_url=row.repo_url,
+        repo_branch=row.repo_branch,
+        repo_name=row.repo_name,
+        reference=row.reference,
+        launch_owner_id=row.launch_owner_id,
+        owner_expires_at=row.owner_expires_at,
+        claim_owner=row.claim_owner,
+        claim_expires_at=row.claim_expires_at,
+        state=decode_managed_credential_lease_state(row.state),
+        created_at=row.created_at,
+        updated_at=row.updated_at,
+    )
+
+
+def _is_credential_generation_conflict(exc: IntegrityError) -> bool:
+    """Return whether an insert lost the generation primary-key race."""
+    diagnostic = getattr(exc.orig, "diag", None)
+    if getattr(diagnostic, "constraint_name", None) == ("pk_managed_credential_leases"):
+        return True
+    message = str(exc.orig).lower()
+    return (
+        "managed_credential_leases" in message
+        and "generation" in message
+        and ("unique" in message or "duplicate" in message)
+    )
+
+
 def hash_host_launch_token(token: str) -> str:
     """
     Digest a managed-host launch token for storage / lookup.
@@ -186,6 +260,500 @@ class HostStore:
         """
         self._engine: Engine = get_or_create_engine(storage_location)
         self._session = make_managed_session_maker(self._engine)
+        self._write_session = make_managed_session_maker(self._engine, immediate=True)
+
+    def record_credential_lease(
+        self,
+        *,
+        host_id: str,
+        user_id: str,
+        host_name: str,
+        sandbox_provider: str,
+        sandbox_id: str,
+        session_id: str | None,
+        repo_url: str | None,
+        repo_branch: str | None,
+        repo_name: str | None,
+        reference: str | None,
+        owner_token: str,
+        owner_expires_at: int | None = None,
+    ) -> CredentialLeaseRecord:
+        """Atomically reserve one pending generation before provider work.
+
+        ``owner_token`` is a random fencing identity, not an authentication
+        token. It grants no provider or application access.
+        """
+        workspace_id = current_workspace_id()
+        if owner_expires_at is None:
+            # Legacy callers that do not renew ownership are recoverable immediately.
+            owner_expires_at = now_epoch()
+        deadline = time.monotonic() + 10.0
+        attempt = 0
+        # BEGIN IMMEDIATE serializes SQLite writers before MAX is read. The
+        # primary key remains the final fence on PostgreSQL; a collision is
+        # retried in a fresh transaction to a deadline rather than a replica
+        # count, so a synchronized burst cannot exhaust a fixed retry budget.
+        while True:
+            try:
+                return self._record_credential_lease_once(
+                    workspace_id=workspace_id,
+                    now=now_epoch(),
+                    host_id=host_id,
+                    user_id=user_id,
+                    host_name=host_name,
+                    sandbox_provider=sandbox_provider,
+                    sandbox_id=sandbox_id,
+                    session_id=session_id,
+                    repo_url=repo_url,
+                    repo_branch=repo_branch,
+                    repo_name=repo_name,
+                    reference=reference,
+                    owner_token=owner_token,
+                    owner_expires_at=owner_expires_at,
+                )
+            except IntegrityError as exc:
+                if not _is_credential_generation_conflict(exc) or time.monotonic() >= deadline:
+                    raise
+                time.sleep(min(0.001 * (2 ** min(attempt, 6)), 0.05))
+                attempt += 1
+
+    def _record_credential_lease_once(
+        self,
+        *,
+        workspace_id: int,
+        now: int,
+        host_id: str,
+        user_id: str,
+        host_name: str,
+        sandbox_provider: str,
+        sandbox_id: str,
+        session_id: str | None,
+        repo_url: str | None,
+        repo_branch: str | None,
+        repo_name: str | None,
+        reference: str | None,
+        owner_token: str,
+        owner_expires_at: int,
+    ) -> CredentialLeaseRecord:
+        """Insert one generation inside a single writer transaction."""
+        with self._write_session() as session:
+            latest = session.execute(
+                select(func.max(SqlManagedCredentialLease.generation)).where(
+                    SqlManagedCredentialLease.workspace_id == workspace_id,
+                    SqlManagedCredentialLease.host_id == host_id,
+                )
+            ).scalar_one()
+            row = SqlManagedCredentialLease(
+                workspace_id=workspace_id,
+                host_id=host_id,
+                generation=(latest or 0) + 1,
+                user_id=user_id,
+                host_name=host_name,
+                sandbox_provider=sandbox_provider,
+                sandbox_id=sandbox_id,
+                session_id=session_id,
+                repo_url=repo_url,
+                repo_branch=repo_branch,
+                repo_name=repo_name,
+                reference=reference,
+                launch_owner_id=owner_token,
+                owner_expires_at=owner_expires_at,
+                state=encode_managed_credential_lease_state("pending"),
+                created_at=now,
+                updated_at=now,
+            )
+            session.add(row)
+            session.flush()
+            return _row_to_credential_lease(row)
+
+    def set_credential_lease_reference(
+        self,
+        host_id: str,
+        generation: int,
+        reference: str | None,
+        owner_token: str,
+    ) -> bool:
+        """CAS-persist the non-secret provider handle for the launch owner."""
+        now = now_epoch()
+        with self._session() as session:
+            result = session.execute(
+                update(SqlManagedCredentialLease)
+                .where(
+                    SqlManagedCredentialLease.workspace_id == current_workspace_id(),
+                    SqlManagedCredentialLease.host_id == host_id,
+                    SqlManagedCredentialLease.generation == generation,
+                    SqlManagedCredentialLease.launch_owner_id == owner_token,
+                    SqlManagedCredentialLease.owner_expires_at > now,
+                    SqlManagedCredentialLease.state
+                    == encode_managed_credential_lease_state("pending"),
+                )
+                .values(reference=reference, updated_at=now)
+            )
+            return _rowcount(result) == 1
+
+    def renew_credential_lease_owner(
+        self,
+        host_id: str,
+        generation: int,
+        *,
+        owner_token: str,
+        owner_expires_at: int,
+    ) -> bool:
+        """Extend an unexpired pending launch-owner lease by CAS."""
+        now = now_epoch()
+        if owner_expires_at <= now:
+            return False
+        with self._session() as session:
+            result = session.execute(
+                update(SqlManagedCredentialLease)
+                .where(
+                    SqlManagedCredentialLease.workspace_id == current_workspace_id(),
+                    SqlManagedCredentialLease.host_id == host_id,
+                    SqlManagedCredentialLease.generation == generation,
+                    SqlManagedCredentialLease.launch_owner_id == owner_token,
+                    SqlManagedCredentialLease.owner_expires_at > now,
+                    SqlManagedCredentialLease.owner_expires_at < owner_expires_at,
+                    SqlManagedCredentialLease.state
+                    == encode_managed_credential_lease_state("pending"),
+                )
+                .values(owner_expires_at=owner_expires_at, updated_at=now)
+            )
+            return _rowcount(result) == 1
+
+    def list_credential_leases(
+        self,
+        host_id: str | None = None,
+        *,
+        include_released: bool = False,
+    ) -> list[CredentialLeaseRecord]:
+        """List durable leases, omitting released tombstones by default."""
+        query = select(SqlManagedCredentialLease).where(
+            SqlManagedCredentialLease.workspace_id == current_workspace_id()
+        )
+        if host_id is not None:
+            query = query.where(SqlManagedCredentialLease.host_id == host_id)
+        if not include_released:
+            query = query.where(
+                SqlManagedCredentialLease.state
+                != encode_managed_credential_lease_state("released")
+            )
+        query = query.order_by(
+            SqlManagedCredentialLease.host_id,
+            SqlManagedCredentialLease.generation,
+        )
+        with self._session() as session:
+            return [_row_to_credential_lease(row) for row in session.scalars(query).all()]
+
+    def activate_credential_lease(
+        self,
+        host_id: str,
+        generation: int,
+        owner_token: str,
+        *,
+        expected_sandbox_id: str | None = None,
+    ) -> bool:
+        """CAS-promote only the pending generation whose sandbox is online."""
+        now = now_epoch()
+        exact_online_binding = (
+            select(SqlHost.host_id)
+            .where(
+                SqlHost.workspace_id == current_workspace_id(),
+                SqlHost.host_id == host_id,
+                SqlHost.sandbox_id == SqlManagedCredentialLease.sandbox_id,
+                SqlHost.status == encode_host_status("online"),
+            )
+            .exists()
+        )
+        with self._session() as session:
+            result = session.execute(
+                update(SqlManagedCredentialLease)
+                .where(
+                    SqlManagedCredentialLease.workspace_id == current_workspace_id(),
+                    SqlManagedCredentialLease.host_id == host_id,
+                    SqlManagedCredentialLease.generation == generation,
+                    SqlManagedCredentialLease.launch_owner_id == owner_token,
+                    SqlManagedCredentialLease.owner_expires_at > now,
+                    (
+                        SqlManagedCredentialLease.sandbox_id.is_not(None)
+                        if expected_sandbox_id is None
+                        else SqlManagedCredentialLease.sandbox_id == expected_sandbox_id
+                    ),
+                    SqlManagedCredentialLease.state
+                    == encode_managed_credential_lease_state("pending"),
+                    exact_online_binding,
+                )
+                .values(
+                    state=encode_managed_credential_lease_state("active"),
+                    updated_at=now,
+                )
+            )
+            return _rowcount(result) == 1
+
+    def claim_active_credential_leases(
+        self,
+        host_id: str,
+        *,
+        claim_owner: str,
+        claim_expires_at: int,
+    ) -> list[CredentialLeaseRecord]:
+        """Atomically claim active generations before relaunch or teardown."""
+        workspace_id = current_workspace_id()
+        now = now_epoch()
+        if claim_expires_at <= now:
+            return []
+        with self._write_session() as session:
+            rows = session.scalars(
+                select(SqlManagedCredentialLease).where(
+                    SqlManagedCredentialLease.workspace_id == workspace_id,
+                    SqlManagedCredentialLease.host_id == host_id,
+                    SqlManagedCredentialLease.state
+                    == encode_managed_credential_lease_state("active"),
+                )
+            ).all()
+            claimed: list[CredentialLeaseRecord] = []
+            for row in rows:
+                result = session.execute(
+                    update(SqlManagedCredentialLease)
+                    .where(
+                        SqlManagedCredentialLease.workspace_id == workspace_id,
+                        SqlManagedCredentialLease.host_id == row.host_id,
+                        SqlManagedCredentialLease.generation == row.generation,
+                        SqlManagedCredentialLease.state
+                        == encode_managed_credential_lease_state("active"),
+                    )
+                    .values(
+                        state=encode_managed_credential_lease_state("retiring"),
+                        claim_owner=claim_owner,
+                        claim_expires_at=claim_expires_at,
+                        updated_at=now,
+                    )
+                )
+                if _rowcount(result) == 1:
+                    row.state = encode_managed_credential_lease_state("retiring")
+                    row.claim_owner = claim_owner
+                    row.claim_expires_at = claim_expires_at
+                    row.updated_at = now
+                    claimed.append(_row_to_credential_lease(row))
+            return claimed
+
+    def claim_pending_credential_lease(
+        self,
+        host_id: str,
+        generation: int,
+        *,
+        owner_token: str,
+        claim_owner: str,
+        claim_expires_at: int,
+    ) -> CredentialLeaseRecord | None:
+        """Claim this launch's pending generation for failure cleanup."""
+        workspace_id = current_workspace_id()
+        now = now_epoch()
+        if claim_expires_at <= now:
+            return None
+        with self._write_session() as session:
+            result = session.execute(
+                update(SqlManagedCredentialLease)
+                .where(
+                    SqlManagedCredentialLease.workspace_id == workspace_id,
+                    SqlManagedCredentialLease.host_id == host_id,
+                    SqlManagedCredentialLease.generation == generation,
+                    SqlManagedCredentialLease.launch_owner_id == owner_token,
+                    SqlManagedCredentialLease.owner_expires_at > now,
+                    SqlManagedCredentialLease.state
+                    == encode_managed_credential_lease_state("pending"),
+                )
+                .values(
+                    state=encode_managed_credential_lease_state("retiring"),
+                    claim_owner=claim_owner,
+                    claim_expires_at=claim_expires_at,
+                    updated_at=now,
+                )
+            )
+            if _rowcount(result) != 1:
+                return None
+            row = session.get(SqlManagedCredentialLease, (workspace_id, host_id, generation))
+            assert row is not None
+            return _row_to_credential_lease(row)
+
+    def renew_credential_lease_claim(
+        self,
+        host_id: str,
+        generation: int,
+        *,
+        claim_owner: str,
+        claim_expires_at: int,
+    ) -> bool:
+        """Extend an unexpired cleanup claim only while the caller owns it."""
+        now = now_epoch()
+        if claim_expires_at <= now:
+            return False
+        with self._session() as session:
+            result = session.execute(
+                update(SqlManagedCredentialLease)
+                .where(
+                    SqlManagedCredentialLease.workspace_id == current_workspace_id(),
+                    SqlManagedCredentialLease.host_id == host_id,
+                    SqlManagedCredentialLease.generation == generation,
+                    SqlManagedCredentialLease.claim_owner == claim_owner,
+                    SqlManagedCredentialLease.claim_expires_at > now,
+                    SqlManagedCredentialLease.claim_expires_at < claim_expires_at,
+                    SqlManagedCredentialLease.state.in_(
+                        (
+                            encode_managed_credential_lease_state("retiring"),
+                            encode_managed_credential_lease_state("recovering"),
+                        )
+                    ),
+                )
+                .values(
+                    claim_expires_at=claim_expires_at,
+                    updated_at=now,
+                )
+            )
+            return _rowcount(result) == 1
+
+    def release_credential_lease(
+        self,
+        host_id: str,
+        generation: int,
+        *,
+        claim_owner: str,
+    ) -> bool:
+        """CAS-tombstone cleanup only while the caller owns a live claim."""
+        now = now_epoch()
+        with self._session() as session:
+            result = session.execute(
+                update(SqlManagedCredentialLease)
+                .where(
+                    SqlManagedCredentialLease.workspace_id == current_workspace_id(),
+                    SqlManagedCredentialLease.host_id == host_id,
+                    SqlManagedCredentialLease.generation == generation,
+                    SqlManagedCredentialLease.claim_owner == claim_owner,
+                    SqlManagedCredentialLease.claim_expires_at > now,
+                    SqlManagedCredentialLease.state.in_(
+                        (
+                            encode_managed_credential_lease_state("retiring"),
+                            encode_managed_credential_lease_state("recovering"),
+                        )
+                    ),
+                )
+                .values(
+                    state=encode_managed_credential_lease_state("released"),
+                    reference=None,
+                    claim_owner=None,
+                    claim_expires_at=None,
+                    updated_at=now,
+                )
+            )
+            return _rowcount(result) == 1
+
+    def claim_recoverable_credential_leases(
+        self,
+        *,
+        claim_owner: str,
+        stale_before: int,
+        claim_expires_at: int,
+        limit: int = 100,
+    ) -> list[CredentialLeaseRecord]:
+        """Atomically claim stale interrupted work without touching live leases."""
+        del stale_before  # Launch-owner expiry is the authoritative liveness fence.
+        workspace_id = current_workspace_id()
+        now = now_epoch()
+        if claim_expires_at <= now:
+            return []
+        pending = encode_managed_credential_lease_state("pending")
+        active = encode_managed_credential_lease_state("active")
+        retiring = encode_managed_credential_lease_state("retiring")
+        recovering = encode_managed_credential_lease_state("recovering")
+        exact_host_binding = (
+            select(SqlHost.host_id)
+            .where(
+                SqlHost.workspace_id == workspace_id,
+                SqlHost.host_id == SqlManagedCredentialLease.host_id,
+                SqlHost.sandbox_id == SqlManagedCredentialLease.sandbox_id,
+            )
+            .exists()
+        )
+        eligible = or_(
+            and_(
+                SqlManagedCredentialLease.state == pending,
+                SqlManagedCredentialLease.owner_expires_at <= now,
+            ),
+            and_(
+                SqlManagedCredentialLease.state.in_((retiring, recovering)),
+                or_(
+                    SqlManagedCredentialLease.claim_expires_at.is_(None),
+                    SqlManagedCredentialLease.claim_expires_at <= now,
+                ),
+            ),
+            and_(SqlManagedCredentialLease.state == active, ~exact_host_binding),
+        )
+        with self._write_session() as session:
+            rows = session.scalars(
+                select(SqlManagedCredentialLease)
+                .where(
+                    SqlManagedCredentialLease.workspace_id == workspace_id,
+                    eligible,
+                )
+                .order_by(
+                    SqlManagedCredentialLease.updated_at,
+                    SqlManagedCredentialLease.host_id,
+                    SqlManagedCredentialLease.generation,
+                )
+                .limit(limit)
+            ).all()
+            claimed: list[CredentialLeaseRecord] = []
+            for row in rows:
+                expected_claim_owner = (
+                    SqlManagedCredentialLease.claim_owner.is_(None)
+                    if row.claim_owner is None
+                    else SqlManagedCredentialLease.claim_owner == row.claim_owner
+                )
+                expected_claim_expiry = (
+                    SqlManagedCredentialLease.claim_expires_at.is_(None)
+                    if row.claim_expires_at is None
+                    else SqlManagedCredentialLease.claim_expires_at == row.claim_expires_at
+                )
+                result = session.execute(
+                    update(SqlManagedCredentialLease)
+                    .where(
+                        SqlManagedCredentialLease.workspace_id == workspace_id,
+                        SqlManagedCredentialLease.host_id == row.host_id,
+                        SqlManagedCredentialLease.generation == row.generation,
+                        SqlManagedCredentialLease.state == row.state,
+                        SqlManagedCredentialLease.updated_at == row.updated_at,
+                        expected_claim_owner,
+                        expected_claim_expiry,
+                        eligible,
+                    )
+                    .values(
+                        state=recovering,
+                        claim_owner=claim_owner,
+                        claim_expires_at=claim_expires_at,
+                        updated_at=now,
+                    )
+                )
+                if _rowcount(result) == 1:
+                    row.state = recovering
+                    row.claim_owner = claim_owner
+                    row.claim_expires_at = claim_expires_at
+                    row.updated_at = now
+                    claimed.append(_row_to_credential_lease(row))
+            return claimed
+
+    def is_host_bound(self, host_id: str) -> bool:
+        """Return whether any durable conversation remains bound to a host."""
+        with self._session() as session:
+            return (
+                session.execute(
+                    select(SqlConversationMetadata.id)
+                    .where(
+                        SqlConversationMetadata.workspace_id == current_workspace_id(),
+                        SqlConversationMetadata.host_id == host_id,
+                    )
+                    .limit(1)
+                ).scalar_one_or_none()
+                is not None
+            )
 
     def upsert_on_connect(
         self,
@@ -650,6 +1218,7 @@ class HostStore:
         provider: str,
         sandbox_id: str,
         token_expires_at: int,
+        expected_sandbox_id: str | None = None,
     ) -> Host:
         """
         Pre-register a server-managed sandbox host with its credential.
@@ -689,11 +1258,11 @@ class HostStore:
         """
         now = now_epoch()
         token_hash = hash_host_launch_token(token)
-        with self._session() as session:
+        with self._write_session() as session:
             existing = session.execute(
-                select(SqlHost).where(
-                    SqlHost.workspace_id == current_workspace_id(), SqlHost.host_id == host_id
-                )
+                select(SqlHost)
+                .where(SqlHost.workspace_id == current_workspace_id(), SqlHost.host_id == host_id)
+                .with_for_update()
             ).scalar_one_or_none()
             if existing is not None:
                 if existing.user_id != user_id:
@@ -707,10 +1276,15 @@ class HostStore:
                         f"host {host_id!r} is registered to a different user; "
                         "refusing to re-credential it"
                     )
+                if expected_sandbox_id is not None and existing.sandbox_id != expected_sandbox_id:
+                    raise RuntimeError(f"managed host {host_id!r} changed during relaunch")
+                sandbox_changed = existing.sandbox_id != sandbox_id
                 existing.token_hash = token_hash
                 existing.token_expires_at = token_expires_at
                 existing.sandbox_provider = provider
                 existing.sandbox_id = sandbox_id
+                if sandbox_changed:
+                    existing.status = encode_host_status("offline")
                 existing.updated_at = now
                 return _row_to_host(existing)
             row = SqlHost(
@@ -768,7 +1342,12 @@ class HostStore:
                 return None
             return _row_to_host(row)
 
-    def delete_host(self, host_id: str) -> None:
+    def delete_host(
+        self,
+        host_id: str,
+        *,
+        expected_sandbox_id: str | None = None,
+    ) -> bool:
         """
         Delete a host row entirely.
 
@@ -781,7 +1360,19 @@ class HostStore:
 
         :param host_id: Host identifier, e.g. ``"host_a1b2c3d4..."``.
         """
-        with self._session() as session:
+        with self._write_session() as session:
+            host = session.execute(
+                select(SqlHost)
+                .where(
+                    SqlHost.workspace_id == current_workspace_id(),
+                    SqlHost.host_id == host_id,
+                )
+                .with_for_update()
+            ).scalar_one_or_none()
+            if host is None or (
+                expected_sandbox_id is not None and host.sandbox_id != expected_sandbox_id
+            ):
+                return False
             session.execute(
                 update(SqlConversationMetadata)
                 .where(
@@ -796,8 +1387,14 @@ class HostStore:
                     SqlHost.host_id == host_id,
                 )
             )
+            return True
 
-    def revoke_launch_token(self, host_id: str) -> None:
+    def revoke_launch_token(
+        self,
+        host_id: str,
+        *,
+        expected_sandbox_id: str | None = None,
+    ) -> bool:
         """
         Clear a managed host's launch credential, keeping the row.
 
@@ -810,14 +1407,17 @@ class HostStore:
 
         :param host_id: Host identifier, e.g. ``"host_a1b2c3d4..."``.
         """
-        with self._session() as session:
+        with self._write_session() as session:
             row = session.execute(
-                select(SqlHost).where(
-                    SqlHost.workspace_id == current_workspace_id(), SqlHost.host_id == host_id
-                )
+                select(SqlHost)
+                .where(SqlHost.workspace_id == current_workspace_id(), SqlHost.host_id == host_id)
+                .with_for_update()
             ).scalar_one_or_none()
-            if row is None:
-                return
+            if row is None or (
+                expected_sandbox_id is not None and row.sandbox_id != expected_sandbox_id
+            ):
+                return False
             row.token_hash = None
             row.token_expires_at = None
             row.updated_at = now_epoch()
+            return True
