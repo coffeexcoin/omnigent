@@ -230,10 +230,64 @@ def test_build_pod_manifest_harness_secret_projects_into_both_containers() -> No
 
 
 def test_build_pod_manifest_omits_envfrom_without_harness_secret() -> None:
-    """No harness Secret → no envFrom key on either container."""
+    """No harness Secret (and no credential reference) → no envFrom on either container."""
     manifest = build_pod_manifest(**{**_MANIFEST_KW, "harness_secret": None})
     assert "envFrom" not in manifest["spec"]["initContainers"][0]
     assert "envFrom" not in manifest["spec"]["containers"][0]
+
+
+def test_build_pod_manifest_without_credential_reference_projects_harness_only() -> None:
+    """credential_reference defaults to None → envFrom carries only the harness Secret."""
+    manifest = build_pod_manifest(**_MANIFEST_KW)
+    only_harness = [{"secretRef": {"name": "omnigent-creds"}}]
+    assert manifest["spec"]["initContainers"][0]["envFrom"] == only_harness
+    assert manifest["spec"]["containers"][0]["envFrom"] == only_harness
+
+
+def test_build_pod_manifest_credential_reference_only_projects_into_both_containers() -> None:
+    """With no harness Secret, the per-launch credential Secret alone rides envFrom on both."""
+    manifest = build_pod_manifest(
+        **{**_MANIFEST_KW, "harness_secret": None}, credential_reference="per-launch-creds"
+    )
+    only_cred = [{"secretRef": {"name": "per-launch-creds"}}]
+    assert manifest["spec"]["initContainers"][0]["envFrom"] == only_cred
+    assert manifest["spec"]["containers"][0]["envFrom"] == only_cred
+
+
+def test_build_pod_manifest_projects_harness_then_credential_reference_in_order() -> None:
+    """Both project envFrom: harness first, per-launch second so its keys win on collision."""
+    manifest = build_pod_manifest(**_MANIFEST_KW, credential_reference="per-launch-creds")
+    ordered = [
+        {"secretRef": {"name": "omnigent-creds"}},
+        {"secretRef": {"name": "per-launch-creds"}},
+    ]
+    assert manifest["spec"]["initContainers"][0]["envFrom"] == ordered
+    assert manifest["spec"]["containers"][0]["envFrom"] == ordered
+
+
+def test_build_pod_manifest_dedupes_identical_harness_and_credential_reference() -> None:
+    """An identical harness + per-launch name collapses to a single envFrom entry."""
+    manifest = build_pod_manifest(
+        **{**_MANIFEST_KW, "harness_secret": "omnigent-creds"},
+        credential_reference="omnigent-creds",
+    )
+    single = [{"secretRef": {"name": "omnigent-creds"}}]
+    assert manifest["spec"]["initContainers"][0]["envFrom"] == single
+    assert manifest["spec"]["containers"][0]["envFrom"] == single
+
+
+@pytest.mark.parametrize(
+    "reference", ["", "Bad_Name", "UPPER", "under_score", "trailing-", "-leading", "a" * 254]
+)
+def test_validate_credential_reference_rejects_empty_and_malformed(reference: str) -> None:
+    """Empty or non-RFC-1123 references fail loudly (before any API side effect)."""
+    with pytest.raises(click.ClickException, match="credential reference is not a valid"):
+        k8s._validate_credential_reference(reference)
+
+
+def test_validate_credential_reference_accepts_valid_secret_name() -> None:
+    """A valid RFC 1123 DNS subdomain Secret name passes validation."""
+    k8s._validate_credential_reference("omnigent-launch-creds-abc123")  # must not raise
 
 
 def test_build_pod_manifest_defaults_to_amd64_node_selector() -> None:
@@ -536,6 +590,47 @@ def test_launch_host_invalid_config_home_fails_before_creating_secret(
         )
     assert "create_secret" not in fake_core.calls
     assert fake_core.created_secrets == []
+
+
+def test_launch_host_forwards_credential_reference_to_pod_envfrom(fake_core: _FakeCore) -> None:
+    """start_host threads the credential reference into the Pod envFrom, after the harness."""
+    fake_core.read_queue = [_pod(phase="Running")]
+    _launcher().start_host(
+        "omnigent-pod-cred",
+        token=_TOKEN,
+        host_id="host_c",
+        host_name="managed-c",
+        server_url="http://srv.example.com",
+        credential_reference="per-launch-creds",
+    )
+    pod = fake_core.created_pods[0]
+    ordered = [
+        {"secretRef": {"name": "omnigent-creds"}},
+        {"secretRef": {"name": "per-launch-creds"}},
+    ]
+    assert pod["spec"]["initContainers"][0]["envFrom"] == ordered
+    assert pod["spec"]["containers"][0]["envFrom"] == ordered
+    # The reference is non-secret, but the raw launch token still appears nowhere.
+    assert _TOKEN not in json.dumps(pod)
+
+
+def test_launch_host_invalid_credential_reference_fails_before_any_create(
+    fake_core: _FakeCore,
+) -> None:
+    """An empty/invalid reference fails before the token Secret or Pod is created."""
+    with pytest.raises(click.ClickException, match="credential reference is not a valid"):
+        _launcher().start_host(
+            "omnigent-pod-badcred",
+            token=_TOKEN,
+            host_id="host_bc",
+            host_name="managed-bc",
+            server_url="http://srv.example.com",
+            credential_reference="",
+        )
+    assert "create_secret" not in fake_core.calls
+    assert "create_pod" not in fake_core.calls
+    assert fake_core.created_secrets == []
+    assert fake_core.created_pods == []
 
 
 def test_launch_host_fast_fails_on_clone_failure_with_log_tail(

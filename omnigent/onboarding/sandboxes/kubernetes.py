@@ -304,6 +304,28 @@ def _validate_k8s_name_env(
         )
 
 
+def _validate_credential_reference(reference: str) -> None:
+    """
+    Validate a per-launch credential reference as an RFC 1123 Secret name.
+
+    The reference is a non-secret handle to an EXISTING Secret a credential hook
+    created; the launcher only projects it via ``envFrom`` and never reads it.
+    Validating before any API side effect fails an empty or malformed reference
+    loudly — so a bad reference cannot orphan the launch-token Secret or Pod on
+    a later apiserver 422. Reuses :data:`_DNS1123_SUBDOMAIN_RE` (a Secret name is
+    a DNS subdomain), the same machinery guarding the config/env-var names.
+
+    :param reference: The credential reference (already known non-``None``).
+    :raises click.ClickException: When *reference* is empty or not a valid
+        RFC 1123 DNS subdomain.
+    """
+    if len(reference) > 253 or not _DNS1123_SUBDOMAIN_RE.fullmatch(reference):
+        raise click.ClickException(
+            "credential reference is not a valid Kubernetes Secret name "
+            f"(RFC 1123 DNS subdomain, max 253 chars): {reference!r}"
+        )
+
+
 def _resolve_pod_resources(resources: dict[str, object] | None) -> dict[str, dict[str, str]]:
     """
     Merge a configured ``sandbox.kubernetes.resources`` block over the built-in
@@ -467,6 +489,7 @@ def build_pod_manifest(
     server_url: str,
     token_secret_name: str,
     harness_secret: str | None,
+    credential_reference: str | None = None,
     env_literals: dict[str, str],
     node_selector: dict[str, str] | None,
     workspace: str,
@@ -494,8 +517,10 @@ def build_pod_manifest(
     - ``automountServiceAccountToken: false`` — a compromised agent cannot reach
       the API with the runner SA.
     - The launch token is referenced via ``secretKeyRef`` (never in the spec);
-      the host identity rides literal env; harness credentials are projected via
-      ``envFrom`` when *harness_secret* is set.
+      the host identity rides literal env; credential Secrets are projected via
+      ``envFrom`` — the deployment-wide *harness_secret* first, then the
+      per-launch *credential_reference* (so its keys win on collision), each an
+      EXISTING Secret referenced by name (never read here).
     - Pod + container ``securityContext`` satisfy Pod Security "restricted"
       (runAsNonRoot as the image's ``sandbox`` user :data:`_RUN_AS_UID`, drop ALL
       caps, ``seccompProfile: RuntimeDefault``, no privilege escalation). The
@@ -512,10 +537,18 @@ def build_pod_manifest(
     :param server_url: URL the host dials back to (baked into the host command).
     :param token_secret_name: Per-Pod Secret holding the launch token, projected
         via ``secretKeyRef``.
-    :param harness_secret: Name of the harness-credentials Secret projected via
-        ``envFrom``, or ``None`` for none.
+    :param harness_secret: Name of the deployment-wide harness-credentials
+        Secret projected via ``envFrom``, or ``None`` for none.
+    :param credential_reference: Name of a per-launch credential Secret (the
+        non-secret handle a credential hook resolved) projected via ``envFrom``
+        after *harness_secret*, or ``None`` for none. Projected into BOTH
+        containers so a private clone and the host both see it; ordered second
+        so a per-launch key overrides the static harness Secret, and an
+        identical name collapses to one ``envFrom`` entry. Only referenced by
+        name — the Secret's values are never read or copied here.
     :param env_literals: Literal name → value env entries (the resolved
-        server-env passthrough). Secrets ride *harness_secret*, not this map.
+        server-env passthrough). Secrets ride *harness_secret* /
+        *credential_reference*, not this map.
     :param node_selector: Extra node selector labels, or ``None``. Merged with
         a default ``kubernetes.io/arch: amd64``; an operator-supplied
         ``kubernetes.io/arch`` entry overrides the default.
@@ -579,9 +612,18 @@ def build_pod_manifest(
         "securityContext": container_security,
         "volumeMounts": home_mount,
     }
-    if harness_secret:
-        # The clone may need GIT_TOKEN (private repos) from the harness Secret.
-        init_container["envFrom"] = [{"secretRef": {"name": harness_secret}}]
+    # envFrom projects EXISTING Secrets by reference (no values are read here).
+    # The deployment-wide harness Secret is listed first and the per-launch
+    # credential Secret second, so a per-launch key wins on collision (envFrom
+    # applies entries in order, later Secrets override earlier ones). Identical
+    # names collapse to one entry. Projected into both containers: the clone may
+    # need GIT_TOKEN (private repos) and the host needs the same credentials.
+    env_from_secret_names: list[str] = []
+    for secret in (harness_secret, credential_reference):
+        if secret and secret not in env_from_secret_names:
+            env_from_secret_names.append(secret)
+    if env_from_secret_names:
+        init_container["envFrom"] = [{"secretRef": {"name": n}} for n in env_from_secret_names]
 
     host_env: list[dict[str, object]] = [
         {"name": "HOME", "value": _HOME_DIR},
@@ -605,8 +647,8 @@ def build_pod_manifest(
         "securityContext": container_security,
         "volumeMounts": home_mount,
     }
-    if harness_secret:
-        host_container["envFrom"] = [{"secretRef": {"name": harness_secret}}]
+    if env_from_secret_names:
+        host_container["envFrom"] = [{"secretRef": {"name": n}} for n in env_from_secret_names]
 
     spec: dict[str, object] = {
         "restartPolicy": "Never",
@@ -1101,12 +1143,15 @@ class KubernetesSandboxLauncher(SandboxLauncher):
             ``None``.
         :param credential_reference: Non-secret handle to per-launch,
             owner-scoped credentials a server-side credential hook resolved
-            (e.g. the name of a Secret the hook created), or ``None`` when no
-            hook is configured. Accepted here so the generic seam reaches this
-            entrypoint-as-host provider, but NOT yet consumed: projecting such
-            a per-launch Secret via ``envFrom`` (alongside the static
-            deployment-wide ``sandbox.kubernetes.secret_name``) is a later
-            change. Never a secret value.
+            (e.g. the name of an EXISTING Secret the hook created), or ``None``
+            when no hook is configured. When set, it is validated as an RFC 1123
+            Secret name and projected via ``envFrom`` into both the init and
+            host containers, AFTER the deployment-wide
+            ``sandbox.kubernetes.secret_name`` so its keys win on collision. The
+            hook owns the Secret's creation and lifecycle; this launcher only
+            references it by name and never reads its values. A non-``None`` but
+            empty/invalid reference fails before the launch-token Secret or Pod
+            is created. Never a secret value.
         :param on_stage: Progress observer; invoked with ``"starting"``.
         :returns: The absolute in-sandbox workspace path (the cloned repository
             directory when *repo_url* is set).
@@ -1117,6 +1162,10 @@ class KubernetesSandboxLauncher(SandboxLauncher):
         from kubernetes.client.rest import ApiException
         from urllib3.exceptions import HTTPError
 
+        # Validate the reference before any API side effect: a bad name must not
+        # create (and orphan) the launch-token Secret or Pod.
+        if credential_reference is not None:
+            _validate_credential_reference(credential_reference)
         namespace = self._resolve_namespace()
         image = self._resolve_image()
         env_literals = self._resolve_sandbox_env()
@@ -1144,6 +1193,7 @@ class KubernetesSandboxLauncher(SandboxLauncher):
                     server_url=server_url,
                     token_secret_name=secret_name,
                     harness_secret=self._resolve_secret(),
+                    credential_reference=credential_reference,
                     env_literals=env_literals,
                     node_selector=self._node_selector,
                     workspace=workspace,
