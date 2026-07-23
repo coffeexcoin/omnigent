@@ -516,17 +516,13 @@ async def test_evaluate_endpoint_passes_actor_to_policy(
     assert body["reason"] == "Blocked user"
 
 
-async def test_evaluate_server_stashed_turn_actor_overrides_request_user_id(
+async def test_evaluate_carried_turn_actor_overrides_request_user_id(
     client: httpx.AsyncClient,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """
-    When the server has stashed a turn-initiating actor for the session
-    (set at forward time from the human's verified ``created_by``), that
-    identity is used for policy evaluation instead of the HTTP request's
-    ``user_id`` (the runner's service-account credential).
-
-    No actor field in the request body is needed or trusted.
+    The actor carried by the runner's pinned turn context is used for policy
+    evaluation instead of the runner service account making the HTTP request.
     """
     policy = FunctionPolicySpec(
         name="admin__deny_blocked_actor",
@@ -550,25 +546,16 @@ async def test_evaluate_server_stashed_turn_actor_overrides_request_user_id(
     agent = await create_test_agent(client)
     session_id = await _create_session(client, agent["id"])
 
-    # Simulate the server persisting the turn-initiating human's identity
-    # (normally written by _forward_event_to_runner via set_labels).
-    from omnigent.runtime import get_conversation_store
-    from omnigent.server.routes.sessions import _TURN_ACTOR_LABEL
-
-    await asyncio.to_thread(
-        get_conversation_store().set_labels,
-        session_id,
-        {_TURN_ACTOR_LABEL: "blocked@test.com"},
-    )
-
+    payload = _tool_call_request("Read")
+    payload["actor"] = {"run_as": "blocked@test.com"}
     resp = await client.post(
         f"/v1/sessions/{session_id}/policies/evaluate",
-        json=_tool_call_request("Read"),
+        json=payload,
     )
     assert resp.status_code == 200
     body = resp.json()
     assert body["result"] == "POLICY_ACTION_DENY", (
-        "persisted turn actor label should override the request user_id"
+        "carried turn actor should override the request user_id"
     )
     assert body["reason"] == "Blocked user"
 

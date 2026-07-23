@@ -140,6 +140,26 @@ async def test_schemas_for_empty_spec_returns_empty_without_network() -> None:
 
 
 @pytest.mark.asyncio
+async def test_tool_calls_pin_actor_to_manager_turn() -> None:
+    """Takeover must not rebind tool calls from an already-running turn."""
+    ok = {"jsonrpc": "2.0", "id": 1, "result": {"content": []}}
+    transport = _StubTransport([_json_resp(ok), _json_resp(ok)])
+    client = httpx.AsyncClient(transport=transport, base_url="http://ap-server")
+    alice = {"run_as": "alice@example.com"}
+    alice_turn = ProxyMcpManager("conv_test", client, actor=alice)
+    alice["run_as"] = "bob@example.com"
+    bob_turn = ProxyMcpManager("conv_test", client, actor={"run_as": "bob@example.com"})
+
+    await alice_turn.call_tool(None, "sys_os_read", {})
+    await bob_turn.call_tool(None, "sys_os_read", {})
+
+    assert [call.body["actor"] for call in transport.calls] == [
+        {"run_as": "alice@example.com"},
+        {"run_as": "bob@example.com"},
+    ]
+
+
+@pytest.mark.asyncio
 async def test_schemas_for_happy_path_parses_tools() -> None:
     """``schemas_for`` must parse a JSON-RPC tools/list response into McpSchemasResult.
 

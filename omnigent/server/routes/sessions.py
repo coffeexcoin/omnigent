@@ -9400,7 +9400,7 @@ async def _forward_event_to_runner(
         the agent spec and initialise :class:`ProxyMcpManager` for
         this turn. ``False`` by default (agents without MCP servers).
     :param created_by: Authenticated identity of the posting actor,
-        recorded on the persisted item for attribution.
+        recorded on the persisted item and carried with the runner turn.
     :returns: The store-assigned id of the persisted item.
     """
     import uuid
@@ -9487,23 +9487,8 @@ async def _forward_event_to_runner(
         # resolved copy — id-based dedup, not a role/content guess.
         "persisted_item_id": persisted_items[0].id,
     }
-    # Persist the turn-initiating actor so /policies/evaluate and MCP
-    # tools/call can read it back on any server replica.  Skip system-driven
-    # forwards (sub-agent results, parent-wake carry created_by=None) — they
-    # must not stomp the in-flight turn's actor.
-    # Known gap: a queued message from user B can overwrite this label while
-    # user A's turn is still executing tool calls on a shared session.  The
-    # runner's _active_turns guard prevents two turns from running on the same
-    # session concurrently, but the label is written at server-forward time
-    # (before the runner queues the message), not at runner-turn-start time.
-    # For the common case (sequential users or single-user sessions) this is
-    # correct; strictly concurrent shared-session use is an accepted gap.
     if created_by is not None:
-        await asyncio.to_thread(
-            conversation_store.set_labels,
-            session_id,
-            {_TURN_ACTOR_LABEL: created_by},
-        )
+        runner_body["actor"] = _build_actor(created_by)
     # Forward request-supplied client-side tool schemas so non-native
     # harnesses can emit (and tunnel) the caller's tools — the runner
     # merges these into the harness tool list (_merge_request_client_tools).
@@ -14670,12 +14655,15 @@ async def _handle_mcp_tools_call(
     try:
         from omnigent.runner.tool_dispatch import MCP_PROXY_FORWARD_TIMEOUT_S
 
+        runner_call: dict[str, Any] = {
+            "method": "tools/call",
+            "params": {"name": namespaced_name, "arguments": arguments},
+        }
+        if actor is not None:
+            runner_call["actor"] = actor
         exec_resp = await runner_client.post(
             f"/v1/sessions/{session_id}/mcp/execute",
-            json={
-                "method": "tools/call",
-                "params": {"name": namespaced_name, "arguments": arguments},
-            },
+            json=runner_call,
             # ``sys_session_send`` returns a launch handle immediately; this
             # timeout now protects ordinary runner proxy hangs.
             timeout=MCP_PROXY_FORWARD_TIMEOUT_S,
@@ -14732,17 +14720,20 @@ async def _handle_mcp_tools_call(
 
         # Retry on the runner with the user's inputResponses.
         try:
+            runner_retry: dict[str, Any] = {
+                "method": "tools/call",
+                "params": {
+                    "name": namespaced_name,
+                    "arguments": arguments,
+                    "inputResponses": input_responses,
+                    "requestState": mcp_request_state,
+                },
+            }
+            if actor is not None:
+                runner_retry["actor"] = actor
             retry_resp = await runner_client.post(
                 f"/v1/sessions/{session_id}/mcp/execute",
-                json={
-                    "method": "tools/call",
-                    "params": {
-                        "name": namespaced_name,
-                        "arguments": arguments,
-                        "inputResponses": input_responses,
-                        "requestState": mcp_request_state,
-                    },
-                },
+                json=runner_retry,
                 timeout=MCP_PROXY_FORWARD_TIMEOUT_S,
             )
             retry_resp.raise_for_status()
@@ -17500,15 +17491,10 @@ def create_sessions_router(
             )
 
         engine = _build_engine()
-        # Use the turn-initiating human's identity (persisted at forward time)
-        # so per-user policies gate on the correct actor even when the HTTP
-        # caller is the runner's service-account credential.  Falls back to
-        # user_id for direct API callers and native-terminal sessions (whose
-        # turns go via _dispatch_session_event_to_runner, which does not write
-        # this label).
-        turn_actor = conv.labels.get(_TURN_ACTOR_LABEL)
+        forwarded_actor = payload.get("actor")
+        turn_actor = forwarded_actor if isinstance(forwarded_actor, dict) else None
         ctx = _build_evaluation_context(
-            phase, data, event, actor=_build_actor(turn_actor or user_id)
+            phase, data, event, actor=turn_actor or _build_actor(user_id)
         )
         result = await engine.evaluate(ctx, read_only=is_read_only)
 
@@ -22308,8 +22294,8 @@ def create_sessions_router(
             )
 
         if method == "tools/call":
-            _mcp_conv = await asyncio.to_thread(conversation_store.get_conversation, session_id)
-            turn_actor = _mcp_conv.labels.get(_TURN_ACTOR_LABEL) if _mcp_conv is not None else None
+            forwarded_actor = body.get("actor")
+            turn_actor = forwarded_actor if isinstance(forwarded_actor, dict) else None
             return await _handle_mcp_tools_call(
                 rpc_id,
                 session_id,
@@ -22317,7 +22303,7 @@ def create_sessions_router(
                 conversation_store,
                 agent_store,
                 runner_router,
-                actor=_build_actor(turn_actor or user_id),
+                actor=turn_actor or _build_actor(user_id),
                 request=request,
             )
 

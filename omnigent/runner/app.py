@@ -58,6 +58,7 @@ from omnigent.llms.summarize import (
     extract_summary_text,
 )
 from omnigent.model_override import validate_model_override
+from omnigent.policies.schema import ActorContext
 from omnigent.policies.types import FAIL_CLOSED_PHASES
 from omnigent.runner import pending_approvals
 from omnigent.runner.codex.goal import CodexGoalRunner
@@ -6735,6 +6736,7 @@ async def _evaluate_policy_via_omnigent(
     evaluation_id: str,
     phase: str,
     data: dict[str, Any],
+    actor: ActorContext | None = None,
 ) -> None:
     """
     Proxy a policy evaluation request from the harness to the Omnigent server.
@@ -6770,6 +6772,7 @@ async def _evaluate_policy_via_omnigent(
     :param phase: Proto-style phase string, e.g.
         ``"PHASE_LLM_REQUEST"``.
     :param data: Event data dict for the policy engine.
+    :param actor: Actor pinned to the turn that emitted the policy request.
     """
     # Default verdict on error / non-200 / timeout. Phase-aware: TOOL_CALL
     # fails CLOSED (this round-trip is the authoritative gate for
@@ -6787,14 +6790,16 @@ async def _evaluate_policy_via_omnigent(
     verdict_data: dict[str, Any] | None = None
 
     try:
+        event: dict[str, Any] = {
+            "type": phase,
+            "data": data,
+        }
+        request_body: dict[str, Any] = {"event": event}
+        if actor is not None:
+            request_body["actor"] = dict(actor)
         ap_resp = await server_client.post(
             f"/v1/sessions/{conversation_id}/policies/evaluate",
-            json={
-                "event": {
-                    "type": phase,
-                    "data": data,
-                },
-            },
+            json=request_body,
             # A TOOL_CALL/LLM_REQUEST/REQUEST ASK parks server-side in
             # ``_hold_native_ask_gate`` until a human resolves it (up to the
             # deciding policy's ``ask_timeout``, default one day). A 30s read
@@ -7084,6 +7089,8 @@ class TurnDispatch:
         These are executed by the caller, not the runner, so the
         proxy_stream relays their ``action_required`` events upstream
         to tunnel rather than dispatching them locally.
+    :param actor: Authenticated actor pinned to this turn. Tool calls and
+        policy evaluations carry this value back through the server.
     """
 
     agent_id: str | None = None
@@ -7093,6 +7100,7 @@ class TurnDispatch:
     agent_version: int | None = None
     spawn_env: dict[str, str] | None = None
     client_side_tool_names: frozenset[str] = frozenset()
+    actor: ActorContext | None = None
 
 
 def _wrap_as_message_event(body: dict[str, Any]) -> dict[str, Any]:
@@ -14500,6 +14508,7 @@ def create_runner_app(
                 or msg_body.get("has_mcp_servers") is True
             ),
             instructions=instructions,
+            actor=msg_body.get("actor"),
         )
 
         harness_body: dict[str, Any] = {
@@ -14997,6 +15006,7 @@ def create_runner_app(
         _mcp_schemas: list[dict[str, Any]] = []
         _mcp_tool_names: set[str] = set()
         _eager_spec_error: tuple[str, str] | None = None
+        _turn_actor = dispatch.actor if dispatch is not None else body.get("actor")
         if _has_mcp_hint is True and _turn_agent_id:
             # Check both spec caches: agent-keyed (MCP path) and
             # session-keyed (session creation path).
@@ -15030,7 +15040,7 @@ def create_runner_app(
                         _spec_cache[_turn_agent_id] = _resolved_turn_spec
                         _turn_spec_entry = _resolved_turn_spec
             _turn_spec_resolved = True
-            _turn_mcp: Any = ProxyMcpManager(conv_id, server_client)
+            _turn_mcp: Any = ProxyMcpManager(conv_id, server_client, actor=_turn_actor)
             if _eager_spec_error is None and _turn_spec is not None:
                 try:
                     _mcp = await _turn_mcp.schemas_for(_turn_spec)
@@ -15452,6 +15462,7 @@ def create_runner_app(
                                             conv_id,
                                             server_client,
                                             publish_event=_publish_event,
+                                            actor=_turn_actor,
                                         )
                                         _dispatch_tasks.append(
                                             _asyncio.create_task(
@@ -15504,6 +15515,7 @@ def create_runner_app(
                                                 evaluation_id=_eval_id,
                                                 phase=_eval_phase,
                                                 data=_eval_data,
+                                                actor=_turn_actor,
                                             )
                                         )
                                     )
