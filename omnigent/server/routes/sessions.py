@@ -13018,6 +13018,68 @@ def _require_cost_control_label_authority(
     )
 
 
+def _validated_runner_actor(
+    raw_actor: Any,
+    *,
+    tunnel_token: str | None,
+    bound_runner_id: str | None,
+    allowed_tunnel_tokens: frozenset[str] | None,
+) -> dict[str, str] | None:
+    """Validate actor context forwarded by the session's bound runner.
+
+    A request bearer proves only the HTTP caller's identity. It must not
+    authorize a caller-supplied actor override, because shared-session runners
+    use a service bearer while forwarding the human who started the turn.
+    The separate tunnel binding token supplies that runner proof.
+
+    :param raw_actor: Optional JSON ``actor`` value from the request body.
+    :param tunnel_token: Runner tunnel binding token request header.
+    :param bound_runner_id: Runner currently bound to the session.
+    :param allowed_tunnel_tokens: Optional managed-pool token allow-list.
+    :returns: A validated actor, or ``None`` when no actor was supplied.
+    :raises OmnigentError: 400 for malformed actor data, or 403 when an
+        untrusted caller attempts to override actor identity.
+    """
+    if raw_actor is None:
+        return None
+    if not isinstance(raw_actor, dict):
+        raise OmnigentError("actor must be a JSON object", code=ErrorCode.INVALID_INPUT)
+    unknown_keys = set(raw_actor) - {"run_as", "client_id"}
+    if unknown_keys:
+        keys = ", ".join(sorted(str(key) for key in unknown_keys))
+        raise OmnigentError(
+            f"actor contains unsupported fields: {keys}", code=ErrorCode.INVALID_INPUT
+        )
+    if not raw_actor:
+        raise OmnigentError("actor must not be empty", code=ErrorCode.INVALID_INPUT)
+    actor: dict[str, str] = {}
+    for key in ("run_as", "client_id"):
+        value = raw_actor.get(key)
+        if value is None:
+            continue
+        if not isinstance(value, str) or not value.strip() or len(value) > 320:
+            raise OmnigentError(
+                f"actor.{key} must be a non-empty string of at most 320 characters",
+                code=ErrorCode.INVALID_INPUT,
+            )
+        actor[key] = value.strip()
+
+    token = (tunnel_token or "").strip()
+    trusted = bool(
+        token
+        and (
+            (allowed_tunnel_tokens is not None and token in allowed_tunnel_tokens)
+            or (bound_runner_id is not None and token_bound_runner_id(token) == bound_runner_id)
+        )
+    )
+    if not trusted:
+        raise OmnigentError(
+            "only the session's bound runner may forward actor context",
+            code=ErrorCode.FORBIDDEN,
+        )
+    return actor
+
+
 async def _create_session_from_existing_agent(
     conversation_store: ConversationStore,
     agent_store: AgentStore,
@@ -17414,6 +17476,12 @@ def create_sessions_router(
                 f"Session {session_id!r} not found.",
                 code=ErrorCode.NOT_FOUND,
             )
+        turn_actor = _validated_runner_actor(
+            payload.get("actor"),
+            tunnel_token=request.headers.get(RUNNER_TUNNEL_TOKEN_HEADER),
+            bound_runner_id=conv.runner_id,
+            allowed_tunnel_tokens=runner_tunnel_tokens,
+        )
         # Dedup the native request-phase gate. A native session's
         # ``UserPromptSubmit`` hook posts ``PHASE_REQUEST`` here for *every*
         # prompt, but a web-UI prompt was already gated server-side by
@@ -17491,8 +17559,6 @@ def create_sessions_router(
             )
 
         engine = _build_engine()
-        forwarded_actor = payload.get("actor")
-        turn_actor = forwarded_actor if isinstance(forwarded_actor, dict) else None
         ctx = _build_evaluation_context(
             phase, data, event, actor=turn_actor or _build_actor(user_id)
         )
@@ -22294,8 +22360,18 @@ def create_sessions_router(
             )
 
         if method == "tools/call":
-            forwarded_actor = body.get("actor")
-            turn_actor = forwarded_actor if isinstance(forwarded_actor, dict) else None
+            conv = await asyncio.to_thread(conversation_store.get_conversation, session_id)
+            if conv is None:
+                raise OmnigentError(
+                    f"Session {session_id!r} not found.",
+                    code=ErrorCode.NOT_FOUND,
+                )
+            turn_actor = _validated_runner_actor(
+                body.get("actor"),
+                tunnel_token=request.headers.get(RUNNER_TUNNEL_TOKEN_HEADER),
+                bound_runner_id=conv.runner_id,
+                allowed_tunnel_tokens=runner_tunnel_tokens,
+            )
             return await _handle_mcp_tools_call(
                 rpc_id,
                 session_id,

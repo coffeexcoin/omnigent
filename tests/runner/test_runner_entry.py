@@ -31,6 +31,7 @@ from omnigent.runner._entry import (
     _resolve_agent_spec_from_server,
     _run_inactivity_monitor,
     _run_parent_death_killer,
+    _runner_callback_headers,
     _runner_parent_pid_from_env,
     _runner_tunnel_binding_token_from_env,
     _runner_workspace_from_env,
@@ -39,6 +40,7 @@ from omnigent.runner._entry import (
     main,
 )
 from omnigent.runner.identity import (
+    OMNIGENT_INTERNAL_WS_ORIGIN,
     RUNNER_INITIAL_AUTH_TOKEN_ENV_VAR,
     RUNNER_TUNNEL_TOKEN_HEADER,
 )
@@ -964,6 +966,24 @@ def test_runner_tunnel_binding_token_from_env_strips_value(
     monkeypatch.setenv("OMNIGENT_RUNNER_TUNNEL_BINDING_TOKEN", " bind-token ")
 
     assert _runner_tunnel_binding_token_from_env() == "bind-token"
+
+
+def test_runner_callback_headers_include_binding_proof(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Actor-bearing callbacks authenticate as the bound runner."""
+    monkeypatch.setattr(
+        "omnigent.cli_auth.databricks_request_headers",
+        lambda _url: {"X-Workspace-Route": "workspace-1"},
+    )
+
+    headers = _runner_callback_headers("https://server.example", "bind-token")
+
+    assert headers == {
+        "Origin": OMNIGENT_INTERNAL_WS_ORIGIN,
+        "X-Workspace-Route": "workspace-1",
+        RUNNER_TUNNEL_TOKEN_HEADER: "bind-token",
+    }
 
 
 def test_runner_parent_pid_from_env_returns_none_without_pid(

@@ -29,6 +29,7 @@ from typing import Any
 import httpx
 import pytest
 
+from omnigent.runner.identity import RUNNER_TUNNEL_TOKEN_HEADER, token_bound_runner_id
 from omnigent.runtime import get_caps, session_stream
 from omnigent.runtime.caps import RuntimeCaps
 from omnigent.server.routes import sessions as sessions_routes
@@ -519,6 +520,7 @@ async def test_evaluate_endpoint_passes_actor_to_policy(
 async def test_evaluate_carried_turn_actor_overrides_request_user_id(
     client: httpx.AsyncClient,
     monkeypatch: pytest.MonkeyPatch,
+    db_uri: str,
 ) -> None:
     """
     The actor carried by the runner's pinned turn context is used for policy
@@ -545,12 +547,17 @@ async def test_evaluate_carried_turn_actor_overrides_request_user_id(
 
     agent = await create_test_agent(client)
     session_id = await _create_session(client, agent["id"])
+    tunnel_token = "turn-actor-runner-token"
+    SqlAlchemyConversationStore(db_uri).set_runner_id(
+        session_id, token_bound_runner_id(tunnel_token)
+    )
 
     payload = _tool_call_request("Read")
     payload["actor"] = {"run_as": "blocked@test.com"}
     resp = await client.post(
         f"/v1/sessions/{session_id}/policies/evaluate",
         json=payload,
+        headers={RUNNER_TUNNEL_TOKEN_HEADER: tunnel_token},
     )
     assert resp.status_code == 200
     body = resp.json()
@@ -558,6 +565,29 @@ async def test_evaluate_carried_turn_actor_overrides_request_user_id(
         "carried turn actor should override the request user_id"
     )
     assert body["reason"] == "Blocked user"
+
+
+async def test_evaluate_rejects_untrusted_top_level_actor(
+    client: httpx.AsyncClient,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A normal HTTP caller cannot impersonate a different policy actor."""
+    monkeypatch.setattr(
+        "omnigent.server.routes.sessions._get_user_id",
+        lambda _req, _auth: "alice@example.com",
+    )
+    agent = await create_test_agent(client)
+    session_id = await _create_session(client, agent["id"])
+    payload = _tool_call_request("Read")
+    payload["actor"] = {"run_as": "admin@example.com"}
+
+    resp = await client.post(
+        f"/v1/sessions/{session_id}/policies/evaluate",
+        json=payload,
+    )
+
+    assert resp.status_code == 403
+    assert "bound runner" in resp.text
 
 
 async def test_evaluate_body_actor_field_is_ignored(
