@@ -105,6 +105,7 @@ from omnigent.native_coding_agents import (
     native_coding_agent_for_terminal_name,
     native_coding_agent_for_wrapper_label,
 )
+from omnigent.policies.schema import validate_actor_context
 from omnigent.policies.types import (
     ElicitationRequest,
     EvaluationContext,
@@ -1279,13 +1280,6 @@ class _PendingPolicyAskWrites:
 _pending_policy_ask_writes: cachetools.LRUCache[str, _PendingPolicyAskWrites] = (
     cachetools.LRUCache(maxsize=512)
 )
-
-# Label key used to persist the turn-initiating human's identity on the
-# conversation row.  Written at _forward_event_to_runner time so any
-# server replica can read it back when the runner calls /policies/evaluate
-# or /mcp (tools/call).
-_TURN_ACTOR_LABEL = "omnigent.turn_actor"
-
 
 # (conversation_id, deciding_policy) -> lock serializing native ASK gates.
 # When an agent fires several tool calls in parallel, each spawns its own
@@ -9400,7 +9394,7 @@ async def _forward_event_to_runner(
         the agent spec and initialise :class:`ProxyMcpManager` for
         this turn. ``False`` by default (agents without MCP servers).
     :param created_by: Authenticated identity of the posting actor,
-        recorded on the persisted item for attribution.
+        recorded on the persisted item and carried with the runner turn.
     :returns: The store-assigned id of the persisted item.
     """
     import uuid
@@ -9487,23 +9481,8 @@ async def _forward_event_to_runner(
         # resolved copy — id-based dedup, not a role/content guess.
         "persisted_item_id": persisted_items[0].id,
     }
-    # Persist the turn-initiating actor so /policies/evaluate and MCP
-    # tools/call can read it back on any server replica.  Skip system-driven
-    # forwards (sub-agent results, parent-wake carry created_by=None) — they
-    # must not stomp the in-flight turn's actor.
-    # Known gap: a queued message from user B can overwrite this label while
-    # user A's turn is still executing tool calls on a shared session.  The
-    # runner's _active_turns guard prevents two turns from running on the same
-    # session concurrently, but the label is written at server-forward time
-    # (before the runner queues the message), not at runner-turn-start time.
-    # For the common case (sequential users or single-user sessions) this is
-    # correct; strictly concurrent shared-session use is an accepted gap.
     if created_by is not None:
-        await asyncio.to_thread(
-            conversation_store.set_labels,
-            session_id,
-            {_TURN_ACTOR_LABEL: created_by},
-        )
+        runner_body["actor"] = _build_actor(created_by)
     # Forward request-supplied client-side tool schemas so non-native
     # harnesses can emit (and tunnel) the caller's tools — the runner
     # merges these into the harness tool list (_merge_request_client_tools).
@@ -12965,25 +12944,6 @@ def _reject_reserved_cost_control_label_seed(labels: dict[str, str]) -> None:
         )
 
 
-def _reject_server_reserved_label_seed(labels: dict[str, str] | None) -> None:
-    """
-    Reject a client-supplied label map that touches server-internal keys.
-
-    Keys in this set are written exclusively by server internals and must
-    not be client-settable — doing so would let callers forge security-
-    critical metadata (e.g. the policy-evaluation actor identity).
-
-    :param labels: The client-supplied label mapping, or ``None``.
-    :raises OmnigentError: 400 when any reserved key is present.
-    """
-    if not labels or _TURN_ACTOR_LABEL not in labels:
-        return
-    raise OmnigentError(
-        f"label {_TURN_ACTOR_LABEL!r} is server-internal and cannot be set by clients",
-        code=ErrorCode.INVALID_INPUT,
-    )
-
-
 def _require_cost_control_label_authority(
     *,
     reserved_keys: Sequence[str],
@@ -13031,6 +12991,58 @@ def _require_cost_control_label_authority(
         "bound runner may write them",
         code=ErrorCode.FORBIDDEN,
     )
+
+
+def _validated_runner_actor(
+    raw_actor: Any,
+    *,
+    tunnel_token: str | None,
+    bound_runner_id: str | None,
+    allowed_tunnel_tokens: frozenset[str] | None,
+    require_runner_proof: bool,
+) -> dict[str, str] | None:
+    """Validate actor context forwarded by the session's bound runner.
+
+    A request bearer proves only the HTTP caller's identity. It must not
+    authorize a caller-supplied actor override, because shared-session runners
+    use a service bearer while forwarding the human who started the turn.
+    The separate tunnel binding token supplies that runner proof.
+    Local single-user mode trusts its loopback runner without a binding token.
+
+    :param raw_actor: Optional JSON ``actor`` value from the request body.
+    :param tunnel_token: Runner tunnel binding token request header.
+    :param bound_runner_id: Runner currently bound to the session.
+    :param allowed_tunnel_tokens: Optional managed-pool token allow-list.
+    :param require_runner_proof: Whether actor overrides require tunnel proof.
+    :returns: A validated actor, or ``None`` when no actor was supplied.
+    :raises OmnigentError: 400 for malformed actor data, or 403 when an
+        untrusted caller attempts to override actor identity.
+    """
+    try:
+        actor = validate_actor_context(raw_actor)
+    except ValueError as exc:
+        raise OmnigentError(str(exc), code=ErrorCode.INVALID_INPUT) from exc
+    if actor is None:
+        return None
+    run_as = actor.get("run_as")
+    assert isinstance(run_as, str)  # validated by validate_actor_context
+    if not require_runner_proof:
+        return {"run_as": run_as}
+
+    token = (tunnel_token or "").strip()
+    trusted = bool(
+        token
+        and (
+            (allowed_tunnel_tokens is not None and token in allowed_tunnel_tokens)
+            or (bound_runner_id is not None and token_bound_runner_id(token) == bound_runner_id)
+        )
+    )
+    if not trusted:
+        raise OmnigentError(
+            "only the session's bound runner may forward actor context",
+            code=ErrorCode.FORBIDDEN,
+        )
+    return {"run_as": run_as}
 
 
 async def _create_session_from_existing_agent(
@@ -13081,7 +13093,6 @@ async def _create_session_from_existing_agent(
         fails authorization.
     """
     _reject_reserved_cost_control_label_seed(body.labels)
-    _reject_server_reserved_label_seed(body.labels)
 
     agent = await validate_session_agent(
         user_id=user_id,
@@ -14670,12 +14681,15 @@ async def _handle_mcp_tools_call(
     try:
         from omnigent.runner.tool_dispatch import MCP_PROXY_FORWARD_TIMEOUT_S
 
+        runner_call: dict[str, Any] = {
+            "method": "tools/call",
+            "params": {"name": namespaced_name, "arguments": arguments},
+        }
+        if actor is not None:
+            runner_call["actor"] = actor
         exec_resp = await runner_client.post(
             f"/v1/sessions/{session_id}/mcp/execute",
-            json={
-                "method": "tools/call",
-                "params": {"name": namespaced_name, "arguments": arguments},
-            },
+            json=runner_call,
             # ``sys_session_send`` returns a launch handle immediately; this
             # timeout now protects ordinary runner proxy hangs.
             timeout=MCP_PROXY_FORWARD_TIMEOUT_S,
@@ -14732,17 +14746,20 @@ async def _handle_mcp_tools_call(
 
         # Retry on the runner with the user's inputResponses.
         try:
+            runner_retry: dict[str, Any] = {
+                "method": "tools/call",
+                "params": {
+                    "name": namespaced_name,
+                    "arguments": arguments,
+                    "inputResponses": input_responses,
+                    "requestState": mcp_request_state,
+                },
+            }
+            if actor is not None:
+                runner_retry["actor"] = actor
             retry_resp = await runner_client.post(
                 f"/v1/sessions/{session_id}/mcp/execute",
-                json={
-                    "method": "tools/call",
-                    "params": {
-                        "name": namespaced_name,
-                        "arguments": arguments,
-                        "inputResponses": input_responses,
-                        "requestState": mcp_request_state,
-                    },
-                },
+                json=runner_retry,
                 timeout=MCP_PROXY_FORWARD_TIMEOUT_S,
             )
             retry_resp.raise_for_status()
@@ -15299,7 +15316,6 @@ def create_sessions_router(
             raise HTTPException(status_code=422, detail=[_multipart_missing_detail("bundle")])
         parsed_metadata = _parse_session_create_metadata(metadata)
         _reject_reserved_cost_control_label_seed(parsed_metadata.labels)
-        _reject_server_reserved_label_seed(parsed_metadata.labels)
 
         inherited_runner_id: str | None = None
         if parsed_metadata.parent_session_id is not None:
@@ -16217,7 +16233,6 @@ def create_sessions_router(
                     code=ErrorCode.FORBIDDEN,
                 )
         if body.labels:
-            _reject_server_reserved_label_seed(body.labels)
             # Advisor-owned cost_control.* labels are written only by the
             # session's bound runner; gate them on runner proof BEFORE any
             # store mutation so a rejected request leaves the session untouched.
@@ -17423,6 +17438,13 @@ def create_sessions_router(
                 f"Session {session_id!r} not found.",
                 code=ErrorCode.NOT_FOUND,
             )
+        turn_actor = _validated_runner_actor(
+            payload.get("actor"),
+            tunnel_token=request.headers.get(RUNNER_TUNNEL_TOKEN_HEADER),
+            bound_runner_id=conv.runner_id,
+            allowed_tunnel_tokens=runner_tunnel_tokens,
+            require_runner_proof=permission_store is not None or user_id is not None,
+        )
         # Dedup the native request-phase gate. A native session's
         # ``UserPromptSubmit`` hook posts ``PHASE_REQUEST`` here for *every*
         # prompt, but a web-UI prompt was already gated server-side by
@@ -17500,15 +17522,8 @@ def create_sessions_router(
             )
 
         engine = _build_engine()
-        # Use the turn-initiating human's identity (persisted at forward time)
-        # so per-user policies gate on the correct actor even when the HTTP
-        # caller is the runner's service-account credential.  Falls back to
-        # user_id for direct API callers and native-terminal sessions (whose
-        # turns go via _dispatch_session_event_to_runner, which does not write
-        # this label).
-        turn_actor = conv.labels.get(_TURN_ACTOR_LABEL)
         ctx = _build_evaluation_context(
-            phase, data, event, actor=_build_actor(turn_actor or user_id)
+            phase, data, event, actor=turn_actor or _build_actor(user_id)
         )
         result = await engine.evaluate(ctx, read_only=is_read_only)
 
@@ -22308,8 +22323,19 @@ def create_sessions_router(
             )
 
         if method == "tools/call":
-            _mcp_conv = await asyncio.to_thread(conversation_store.get_conversation, session_id)
-            turn_actor = _mcp_conv.labels.get(_TURN_ACTOR_LABEL) if _mcp_conv is not None else None
+            conv = await asyncio.to_thread(conversation_store.get_conversation, session_id)
+            if conv is None:
+                raise OmnigentError(
+                    f"Session {session_id!r} not found.",
+                    code=ErrorCode.NOT_FOUND,
+                )
+            turn_actor = _validated_runner_actor(
+                body.get("actor"),
+                tunnel_token=request.headers.get(RUNNER_TUNNEL_TOKEN_HEADER),
+                bound_runner_id=conv.runner_id,
+                allowed_tunnel_tokens=runner_tunnel_tokens,
+                require_runner_proof=permission_store is not None or user_id is not None,
+            )
             return await _handle_mcp_tools_call(
                 rpc_id,
                 session_id,
@@ -22317,7 +22343,7 @@ def create_sessions_router(
                 conversation_store,
                 agent_store,
                 runner_router,
-                actor=_build_actor(turn_actor or user_id),
+                actor=turn_actor or _build_actor(user_id),
                 request=request,
             )
 

@@ -32,6 +32,7 @@ class _CaptureClient:
         """Record the path + body and return a fake 202 response."""
         self._captured["path"] = path
         self._captured["body"] = json
+        self._captured.setdefault("calls", []).append((path, json))
 
         class _Resp:
             status_code = 202
@@ -255,3 +256,39 @@ async def test_runner_body_omits_harness_override_when_unset(
     assert event.status_code == 202, event.text
     assert captured.get("body") is not None
     assert "harness_override" not in captured["body"]
+
+
+async def test_runner_body_stamps_authenticated_turn_actor(
+    client: httpx.AsyncClient,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The server stamps the authenticated message author on the runner turn."""
+    captured = _stub_runner_client(monkeypatch)
+    agent = await create_test_agent(client)
+    created = await client.post(
+        "/v1/sessions",
+        json={"agent_id": agent["id"], "initial_items": []},
+    )
+    sid = created.json()["id"]
+    from omnigent.server.routes import sessions as sessions_mod
+
+    monkeypatch.setattr(
+        sessions_mod,
+        "_get_user_id",
+        lambda _request, _provider: "alice@example.com",
+    )
+
+    event = await client.post(
+        f"/v1/sessions/{sid}/events",
+        json={
+            "type": "message",
+            "data": {
+                "role": "user",
+                "content": [{"type": "input_text", "text": "actor check"}],
+            },
+        },
+    )
+
+    assert event.status_code == 202, event.text
+    event_bodies = [body for path, body in captured["calls"] if path.endswith("/events")]
+    assert event_bodies[-1]["actor"] == {"run_as": "alice@example.com"}

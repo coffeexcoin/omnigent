@@ -701,6 +701,23 @@ def _runner_tunnel_binding_token_from_env() -> str | None:
     return token.strip()
 
 
+def _runner_callback_headers(server_url: str, binding_token: str | None) -> dict[str, str]:
+    """Build headers for runner-to-server HTTP callbacks."""
+    from omnigent.cli_auth import databricks_request_headers
+    from omnigent.runner.identity import (
+        OMNIGENT_INTERNAL_WS_ORIGIN,
+        RUNNER_TUNNEL_TOKEN_HEADER,
+    )
+
+    headers = {
+        "Origin": OMNIGENT_INTERNAL_WS_ORIGIN,
+        **databricks_request_headers(server_url),
+    }
+    if binding_token is not None:
+        headers[RUNNER_TUNNEL_TOKEN_HEADER] = binding_token
+    return headers
+
+
 def _runner_parent_pid_from_env() -> int | None:
     """Return the optional parent process id from the environment.
 
@@ -972,10 +989,8 @@ def create_app(
         the app builds its own.
     :returns: A runner FastAPI app exposing the harness-contract subset.
     """
-    from omnigent.cli_auth import databricks_request_headers
     from omnigent.runner.app import create_runner_app
     from omnigent.runner.identity import (
-        OMNIGENT_INTERNAL_WS_ORIGIN,
         OMNIGENT_SESSION_ENV_VALUE,
         OMNIGENT_SESSION_ENV_VAR,
         RUNNER_ID_ENV_VAR,
@@ -1017,6 +1032,8 @@ def create_app(
     # token cache); otherwise build our own.
     if auth_token_factory is None:
         auth_token_factory = _make_auth_token_factory()
+    runner_auth_token = _runner_tunnel_binding_token_from_env()
+    callback_headers = _runner_callback_headers(server_url, runner_auth_token)
     server_client = httpx.AsyncClient(
         base_url=server_url,
         auth=_RunnerDatabricksAuth(auth_token_factory),
@@ -1029,7 +1046,7 @@ def create_app(
         #
         # The workspace-routing header (empty unless a ?o= selector was
         # recorded for this server) routes these callbacks to the workspace.
-        headers={"Origin": OMNIGENT_INTERNAL_WS_ORIGIN, **databricks_request_headers(server_url)},
+        headers=callback_headers,
         timeout=httpx.Timeout(5.0, read=None),
         # NOTE: ``follow_redirects`` deliberately stays False.
         # ``_RunnerDatabricksAuth.auth_flow`` needs to *see* the
@@ -1108,8 +1125,6 @@ def create_app(
     # Reuse the tunnel binding token for runner-side request auth.
     # The same secret is already shared between the
     # CLI launcher and this runner process via env var.
-    runner_auth_token = _runner_tunnel_binding_token_from_env()
-
     app = create_runner_app(
         process_manager=pm,
         spec_resolver=spec_resolver,

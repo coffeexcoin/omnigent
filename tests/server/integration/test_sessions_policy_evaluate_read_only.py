@@ -24,6 +24,7 @@ import pytest
 import pytest_asyncio
 from fastapi import FastAPI
 
+from omnigent.runner.identity import RUNNER_TUNNEL_TOKEN_HEADER, token_bound_runner_id
 from omnigent.runtime import get_caps
 from omnigent.runtime.agent_cache import AgentCache
 from omnigent.runtime.caps import RuntimeCaps
@@ -77,6 +78,16 @@ def _ask_on_request(event: dict[str, Any]) -> dict[str, Any]:
         "result": "ASK",
         "reason": "Prompt requires approval",
     }
+
+
+def _deny_owner_actor(event: dict[str, Any]) -> dict[str, Any]:
+    """Deny tool calls attributed to the session owner."""
+    if event.get("type") != "tool_call":
+        return {"result": "ALLOW"}
+    actor = event.get("context", {}).get("actor", {})
+    if actor.get("run_as") == OWNER:
+        return {"result": "DENY", "reason": "owner actor observed"}
+    return {"result": "ALLOW"}
 
 
 # ── Helpers ──────────────────────────────────────────────────────
@@ -236,6 +247,106 @@ def _get_labels(db_uri: str, session_id: str) -> dict[str, str]:
 
 
 # ── Tests ────────────────────────────────────────────────────────
+
+
+async def test_collaborator_takeover_does_not_rebind_delayed_tool_actor(
+    auth_client: httpx.AsyncClient,
+    monkeypatch: pytest.MonkeyPatch,
+    db_uri: str,
+) -> None:
+    """A delayed owner tool callback stays pinned after an editor takes over."""
+    policy = FunctionPolicySpec(
+        name="admin__deny_owner_actor",
+        on=None,
+        function=FunctionRef(path=f"{__name__}._deny_owner_actor"),
+    )
+    original_caps = get_caps()
+    monkeypatch.setattr(
+        "omnigent.server.routes.sessions.get_caps",
+        lambda: RuntimeCaps(
+            execution_timeout=original_caps.execution_timeout,
+            default_policies=[policy],
+        ),
+    )
+
+    forwarded_turns: list[dict[str, Any]] = []
+
+    class _RunnerClient:
+        async def post(self, path: str, *, json: dict[str, Any], **_: Any) -> httpx.Response:
+            forwarded_turns.append(json)
+            return httpx.Response(202, request=httpx.Request("POST", f"http://runner{path}"))
+
+    async def _runner_client(*_: Any, **__: Any) -> _RunnerClient:
+        return _RunnerClient()
+
+    monkeypatch.setattr("omnigent.server.routes.sessions._get_runner_client", _runner_client)
+
+    async def _relay_ready(*_: Any, **__: Any) -> None:
+        return None
+
+    monkeypatch.setattr("omnigent.server.routes.sessions._ensure_runner_relay_ready", _relay_ready)
+
+    agent = await create_test_agent(auth_client, user=OWNER)
+    session_id = await _create_session_as(auth_client, OWNER, agent["id"])
+    _grant_access(db_uri, EDITOR, session_id, LEVEL_EDIT)
+    tunnel_token = "collaborator-takeover-runner-token"
+    SqlAlchemyConversationStore(db_uri).set_runner_id(
+        session_id, token_bound_runner_id(tunnel_token)
+    )
+
+    def message(text: str) -> dict[str, Any]:
+        return {
+            "type": "message",
+            "data": {
+                "role": "user",
+                "content": [{"type": "input_text", "text": text}],
+            },
+        }
+
+    owner_turn = await auth_client.post(
+        f"/v1/sessions/{session_id}/events",
+        json=message("owner starts a tool"),
+        headers={"X-Forwarded-Email": OWNER},
+    )
+    editor_turn = await auth_client.post(
+        f"/v1/sessions/{session_id}/events",
+        json=message("editor takes over"),
+        headers={"X-Forwarded-Email": EDITOR},
+    )
+    assert owner_turn.status_code == 202, owner_turn.text
+    assert editor_turn.status_code == 202, editor_turn.text
+    assert [turn["actor"] for turn in forwarded_turns[-2:]] == [
+        {"run_as": OWNER},
+        {"run_as": EDITOR},
+    ]
+
+    callback_headers = {
+        "X-Forwarded-Email": OWNER,
+        RUNNER_TUNNEL_TOKEN_HEADER: tunnel_token,
+    }
+    editor_callback = _tool_call_request("Read")
+    editor_callback["actor"] = forwarded_turns[-1]["actor"]
+    editor_result = await auth_client.post(
+        f"/v1/sessions/{session_id}/policies/evaluate",
+        json=editor_callback,
+        headers=callback_headers,
+    )
+
+    delayed_owner_callback = _tool_call_request("Read")
+    delayed_owner_callback["actor"] = forwarded_turns[-2]["actor"]
+    owner_result = await auth_client.post(
+        f"/v1/sessions/{session_id}/policies/evaluate",
+        json=delayed_owner_callback,
+        headers=callback_headers,
+    )
+
+    assert editor_result.status_code == 200, editor_result.text
+    assert editor_result.json()["result"] == "POLICY_ACTION_ALLOW"
+    assert owner_result.status_code == 200, owner_result.text
+    assert owner_result.json() == {
+        "result": "POLICY_ACTION_DENY",
+        "reason": "owner actor observed",
+    }
 
 
 async def test_read_only_caller_gets_verdict_but_no_label_mutation(

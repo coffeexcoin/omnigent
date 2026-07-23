@@ -56,6 +56,23 @@ class ActorContext(TypedDict, total=False):
     client_id: str
 
 
+def validate_actor_context(value: object) -> ActorContext | None:
+    """Validate and copy an optional turn actor from an untrusted payload.
+
+    :param value: Raw actor value from a server or runner request.
+    :returns: A canonical actor mapping, or ``None`` when no actor was supplied.
+    :raises ValueError: If the value is not the exact turn-actor shape.
+    """
+    if value is None:
+        return None
+    if not isinstance(value, dict) or set(value) != {"run_as"}:
+        raise ValueError("actor must be an object containing only 'run_as'")
+    run_as = value["run_as"]
+    if not isinstance(run_as, str) or not run_as.strip() or len(run_as) > 320:
+        raise ValueError("actor.run_as must be a non-empty string of at most 320 characters")
+    return {"run_as": run_as.strip()}
+
+
 class UsageContext(TypedDict, total=False):
     """Cumulative LLM token usage and cost for the session.
 

@@ -52,6 +52,18 @@ class _CapturingHarnessClient:
         return httpx.Response(200, json={})
 
 
+class _CapturingServerClient(_StatusServerClient):
+    """Successful server client that records the policy request body."""
+
+    def __init__(self) -> None:
+        super().__init__(200, {"result": "POLICY_ACTION_ALLOW"})
+        self.posted: list[dict[str, Any]] = []
+
+    async def post(self, _url: str, *, json: dict[str, Any], timeout: float) -> httpx.Response:
+        self.posted.append(json)
+        return await super().post(_url, json=json, timeout=timeout)
+
+
 async def _run(server_client: Any, phase: str) -> dict[str, Any]:
     """Drive the proxy once and return the verdict body posted to the harness.
 
@@ -111,3 +123,20 @@ async def test_success_deny_verdict_passed_through() -> None:
     verdict = await _run(server, "PHASE_TOOL_CALL")
     assert verdict["action"] == "POLICY_ACTION_DENY", verdict
     assert verdict["reason"] == "blocked"
+
+
+async def test_policy_evaluation_carries_pinned_turn_actor() -> None:
+    """Runner policy round-trips carry the actor stamped on the turn."""
+    server = _CapturingServerClient()
+    harness = _CapturingHarnessClient()
+    await _evaluate_policy_via_omnigent(
+        server_client=server,
+        harness_client=harness,
+        conversation_id="conv_test",
+        evaluation_id="poleval_test",
+        phase="PHASE_TOOL_CALL",
+        data={"name": "sys_os_read", "arguments": {}},
+        actor={"run_as": "alice@example.com"},
+    )
+
+    assert server.posted[0]["actor"] == {"run_as": "alice@example.com"}

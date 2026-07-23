@@ -28,7 +28,9 @@ from typing import Any
 
 import httpx
 import pytest
+from starlette.responses import JSONResponse
 
+from omnigent.runner.identity import RUNNER_TUNNEL_TOKEN_HEADER, token_bound_runner_id
 from omnigent.runtime import get_caps, session_stream
 from omnigent.runtime.caps import RuntimeCaps
 from omnigent.server.routes import sessions as sessions_routes
@@ -516,17 +518,14 @@ async def test_evaluate_endpoint_passes_actor_to_policy(
     assert body["reason"] == "Blocked user"
 
 
-async def test_evaluate_server_stashed_turn_actor_overrides_request_user_id(
+async def test_evaluate_carried_turn_actor_overrides_request_user_id(
     client: httpx.AsyncClient,
     monkeypatch: pytest.MonkeyPatch,
+    db_uri: str,
 ) -> None:
     """
-    When the server has stashed a turn-initiating actor for the session
-    (set at forward time from the human's verified ``created_by``), that
-    identity is used for policy evaluation instead of the HTTP request's
-    ``user_id`` (the runner's service-account credential).
-
-    No actor field in the request body is needed or trusted.
+    The actor carried by the runner's pinned turn context is used for policy
+    evaluation instead of the runner service account making the HTTP request.
     """
     policy = FunctionPolicySpec(
         name="admin__deny_blocked_actor",
@@ -549,28 +548,165 @@ async def test_evaluate_server_stashed_turn_actor_overrides_request_user_id(
 
     agent = await create_test_agent(client)
     session_id = await _create_session(client, agent["id"])
-
-    # Simulate the server persisting the turn-initiating human's identity
-    # (normally written by _forward_event_to_runner via set_labels).
-    from omnigent.runtime import get_conversation_store
-    from omnigent.server.routes.sessions import _TURN_ACTOR_LABEL
-
-    await asyncio.to_thread(
-        get_conversation_store().set_labels,
-        session_id,
-        {_TURN_ACTOR_LABEL: "blocked@test.com"},
+    tunnel_token = "turn-actor-runner-token"
+    SqlAlchemyConversationStore(db_uri).set_runner_id(
+        session_id, token_bound_runner_id(tunnel_token)
     )
 
+    payload = _tool_call_request("Read")
+    payload["actor"] = {"run_as": "blocked@test.com"}
     resp = await client.post(
         f"/v1/sessions/{session_id}/policies/evaluate",
-        json=_tool_call_request("Read"),
+        json=payload,
+        headers={RUNNER_TUNNEL_TOKEN_HEADER: tunnel_token},
     )
     assert resp.status_code == 200
     body = resp.json()
     assert body["result"] == "POLICY_ACTION_DENY", (
-        "persisted turn actor label should override the request user_id"
+        "carried turn actor should override the request user_id"
     )
     assert body["reason"] == "Blocked user"
+
+
+async def test_evaluate_accepts_runner_actor_in_single_user_mode(
+    client: httpx.AsyncClient,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A loopback runner callback carries turn authority without a tunnel token."""
+    policy = FunctionPolicySpec(
+        name="admin__deny_blocked_actor",
+        on=None,
+        function=FunctionRef(path=f"{__name__}._deny_blocked_actor"),
+    )
+    original_caps = get_caps()
+    monkeypatch.setattr(
+        "omnigent.server.routes.sessions.get_caps",
+        lambda: RuntimeCaps(
+            execution_timeout=original_caps.execution_timeout,
+            default_policies=[policy],
+        ),
+    )
+    monkeypatch.setattr(
+        "omnigent.server.routes.sessions._get_user_id",
+        lambda _req, _auth: None,
+    )
+
+    agent = await create_test_agent(client)
+    session_id = await _create_session(client, agent["id"])
+    payload = _tool_call_request("Read")
+    payload["actor"] = {"run_as": "blocked@test.com"}
+
+    resp = await client.post(
+        f"/v1/sessions/{session_id}/policies/evaluate",
+        json=payload,
+    )
+
+    assert resp.status_code == 200
+    assert resp.json()["result"] == "POLICY_ACTION_DENY"
+
+
+async def test_mcp_accepts_runner_actor_in_single_user_mode(
+    client: httpx.AsyncClient,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A loopback runner MCP callback preserves its turn actor without a token."""
+    captured: dict[str, object] = {}
+
+    async def _capture_call(*_args: object, **kwargs: object) -> JSONResponse:
+        captured.update(kwargs)
+        return JSONResponse({"jsonrpc": "2.0", "id": 1, "result": {}})
+
+    monkeypatch.setattr(sessions_routes, "_handle_mcp_tools_call", _capture_call)
+    agent = await create_test_agent(client)
+    session_id = await _create_session(client, agent["id"])
+
+    resp = await client.post(
+        f"/v1/sessions/{session_id}/mcp",
+        json={
+            "jsonrpc": "2.0",
+            "id": 1,
+            "method": "tools/call",
+            "params": {"name": "Read", "arguments": {}},
+            "actor": {"run_as": "alice@example.com"},
+        },
+    )
+
+    assert resp.status_code == 200
+    assert captured["actor"] == {"run_as": "alice@example.com"}
+
+
+async def test_mcp_rejects_malformed_runner_actor(client: httpx.AsyncClient) -> None:
+    """Malformed MCP callback actor payloads fail closed before dispatch."""
+    agent = await create_test_agent(client)
+    session_id = await _create_session(client, agent["id"])
+
+    resp = await client.post(
+        f"/v1/sessions/{session_id}/mcp",
+        json={
+            "jsonrpc": "2.0",
+            "id": 1,
+            "method": "tools/call",
+            "params": {"name": "Read", "arguments": {}},
+            "actor": {},
+        },
+    )
+
+    assert resp.status_code == 400
+    assert "actor" in resp.text
+
+
+@pytest.mark.parametrize(
+    "actor",
+    [
+        {},
+        {"run_as": ""},
+        {"run_as": "   "},
+        {"run_as": None},
+        {"run_as": 7},
+        {"run_as": "a" * 321},
+        {"run_as": "blocked@test.com", "role": "admin"},
+    ],
+)
+async def test_evaluate_rejects_malformed_runner_actor(
+    client: httpx.AsyncClient,
+    actor: object,
+) -> None:
+    """Malformed callback actor payloads fail closed before policy evaluation."""
+    agent = await create_test_agent(client)
+    session_id = await _create_session(client, agent["id"])
+    payload = _tool_call_request("Read")
+    payload["actor"] = actor
+
+    resp = await client.post(
+        f"/v1/sessions/{session_id}/policies/evaluate",
+        json=payload,
+    )
+
+    assert resp.status_code == 400
+    assert "actor" in resp.text
+
+
+async def test_evaluate_rejects_untrusted_top_level_actor(
+    client: httpx.AsyncClient,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A normal HTTP caller cannot impersonate a different policy actor."""
+    monkeypatch.setattr(
+        "omnigent.server.routes.sessions._get_user_id",
+        lambda _req, _auth: "alice@example.com",
+    )
+    agent = await create_test_agent(client)
+    session_id = await _create_session(client, agent["id"])
+    payload = _tool_call_request("Read")
+    payload["actor"] = {"run_as": "admin@example.com"}
+
+    resp = await client.post(
+        f"/v1/sessions/{session_id}/policies/evaluate",
+        json=payload,
+    )
+
+    assert resp.status_code == 403
+    assert "bound runner" in resp.text
 
 
 async def test_evaluate_body_actor_field_is_ignored(
@@ -579,8 +715,8 @@ async def test_evaluate_body_actor_field_is_ignored(
 ) -> None:
     """
     A caller cannot spoof the policy actor by injecting ``context.actor``
-    into the event payload — the body field is ignored; only the
-    server-stashed turn actor (or the request ``user_id``) is used.
+    into the event payload. Only the runner-carried top-level turn actor
+    (or the request ``user_id`` fallback) is used.
     """
     policy = FunctionPolicySpec(
         name="admin__deny_blocked_actor",
@@ -595,7 +731,7 @@ async def test_evaluate_body_actor_field_is_ignored(
             default_policies=[policy],
         ),
     )
-    # HTTP request is unauthenticated; no turn actor stashed server-side.
+    # HTTP request is unauthenticated and carries no top-level turn actor.
     monkeypatch.setattr(
         "omnigent.server.routes.sessions._get_user_id",
         lambda _req, _auth: None,

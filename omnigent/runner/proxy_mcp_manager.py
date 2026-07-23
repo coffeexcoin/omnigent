@@ -31,6 +31,7 @@ from typing import Any
 
 import httpx
 
+from omnigent.policies.schema import ActorContext
 from omnigent.runner import pending_approvals
 from omnigent.runner.mcp_manager import McpSchemasResult
 from omnigent.runner.tool_dispatch import MCP_PROXY_CALL_TIMEOUT_S
@@ -53,6 +54,7 @@ class ProxyMcpManager:
     :param ap_client: An :class:`httpx.AsyncClient` pointed at the Omnigent server.
         Must already carry the runner's service auth (e.g. Databricks bearer
         token) so requests are accepted by the Omnigent server's auth middleware.
+    :param actor: Authenticated actor pinned to the turn that owns this manager.
     """
 
     def __init__(
@@ -60,6 +62,7 @@ class ProxyMcpManager:
         session_id: str,
         ap_client: httpx.AsyncClient,
         publish_event: Callable[[str, dict[str, Any]], None] | None = None,
+        actor: ActorContext | None = None,
     ) -> None:
         """Create a proxy manager bound to one session.
 
@@ -71,10 +74,14 @@ class ProxyMcpManager:
             when the user decides (keeps the approval-badge counter in
             sync).  Pass ``None`` only in test contexts where the badge
             is irrelevant.
+        :param actor: Authenticated actor for this turn, copied at construction.
         """
         self._session_id = session_id
         self._omnigent_client = ap_client
         self._publish_event = publish_event
+        # Copy the turn actor at manager construction so a later takeover on
+        # the same session cannot rebind an already-running turn's tool calls.
+        self._actor = dict(actor) if actor is not None else None
 
     @property
     def _mcp_url(self) -> str:
@@ -213,6 +220,8 @@ class ProxyMcpManager:
             "method": "tools/call",
             "params": {"name": tool_name, "arguments": arguments},
         }
+        if self._actor is not None:
+            payload["actor"] = self._actor
 
         # At most two iterations: initial call + one approval retry.
         for _attempt in range(2):

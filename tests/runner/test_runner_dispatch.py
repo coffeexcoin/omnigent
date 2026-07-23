@@ -415,6 +415,45 @@ async def test_runner_post_without_manager_returns_501() -> None:
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "actor",
+    [
+        "alice@example.com",
+        {},
+        {"run_as": ""},
+        {"run_as": "   "},
+        {"run_as": None},
+        {"run_as": 7},
+        {"run_as": "a" * 321},
+        {"run_as": "alice@example.com", "role": "admin"},
+    ],
+)
+async def test_runner_rejects_malformed_turn_actor_at_ingress(actor: object) -> None:
+    """The runner rejects malformed actor authority before starting a turn."""
+    app = create_runner_app(
+        process_manager=cast(
+            HarnessProcessManager,
+            _FakeProcessManager(_FakeHarnessClient([])),
+        ),
+        server_client=NullServerClient(),  # type: ignore[arg-type]
+    )
+
+    async with _runner_test_client(app) as http:
+        response = await http.post(
+            "/v1/sessions/conv_invalid_actor/events",
+            json={
+                "type": "message",
+                "role": "user",
+                "content": [{"type": "input_text", "text": "hi"}],
+                "actor": actor,
+            },
+        )
+
+    assert response.status_code == 400
+    assert response.json()["error"] == "invalid_request"
+
+
+@pytest.mark.asyncio
 async def test_runner_resolves_harness_from_fallback_when_no_agent_id(
     started_manager: HarnessProcessManager,
 ) -> None:
