@@ -3071,6 +3071,69 @@ async def test_relaunch_invokes_hook_with_durable_identity(db_uri: str) -> None:
     assert active[0].state == "active"
 
 
+async def test_relaunch_defers_until_retiring_predecessor_release_succeeds(
+    db_uri: str,
+) -> None:
+    """A failed predecessor release cannot overlap a successor credential."""
+
+    class _FailOnceReleaseHook(_FakeCredentialHook):
+        def __init__(self) -> None:
+            super().__init__()
+            self.release_attempts = 0
+
+        async def release(
+            self,
+            context: ManagedCredentialReleaseContext,
+            generation: int,
+            reference: str | None,
+        ) -> None:
+            self.release_attempts += 1
+            if self.release_attempts == 1:
+                raise RuntimeError("temporary credential provider outage")
+            await super().release(context, generation, reference)
+
+    store = HostStore(db_uri)
+    launcher = FakeSandboxLauncher(on_host_start=_online_register(store))
+    hook = _FailOnceReleaseHook()
+    config = _hook_config(launcher, hook)
+    result = await launch_managed_host(config=config, owner=_OWNER, host_store=store)
+    predecessor = store.get_host(result.host_id)
+    assert predecessor is not None
+
+    with pytest.raises(HTTPException) as exc:
+        await relaunch_managed_host(config=config, host=predecessor, host_store=store)
+
+    assert exc.value.status_code == 502
+    assert "credential cleanup" in exc.value.detail
+    assert hook.generations == [1]
+    assert launcher.provisioned_names == [predecessor.name]
+    remaining = store.list_credential_leases(result.host_id)
+    assert [(row.generation, row.state) for row in remaining] == [(1, "retiring")]
+
+    engine = sa.create_engine(db_uri)
+    try:
+        with engine.begin() as connection:
+            connection.execute(
+                sa.text("UPDATE managed_credential_leases SET claim_expires_at = 0")
+            )
+    finally:
+        engine.dispose()
+
+    relaunched = await relaunch_managed_host(
+        config=config,
+        host=predecessor,
+        host_store=HostStore(db_uri),
+    )
+
+    assert relaunched.host_id == result.host_id
+    assert hook.generations == [1, 2]
+    assert [(generation, reference) for _, generation, reference in hook.release_calls] == [
+        (1, "managed-cred-abc123")
+    ]
+    active = store.list_credential_leases(result.host_id)
+    assert [(row.generation, row.state) for row in active] == [(2, "active")]
+
+
 async def test_stale_terminate_does_not_release_newer_generation(db_uri: str) -> None:
     """A delayed teardown is fenced from replacement-generation credentials."""
     host_store = HostStore(db_uri)
@@ -3280,6 +3343,69 @@ async def test_no_hook_launch_timeout_retains_retryable_sandbox_identity(
     assert recovery_launcher.terminated == ["sb-fake-1"]
     assert host_store.list_hosts(_OWNER) == []
     assert host_store.list_credential_leases() == []
+
+
+async def test_hung_cleanup_workers_do_not_exhaust_startup_or_db_executor(
+    db_uri: str,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Saturated provider cleanup stays isolated from lifespan and DB work."""
+    import omnigent.server.managed_hosts as managed_hosts_mod
+
+    executor = managed_hosts_mod._BoundedProviderCleanupExecutor(max_workers=2)
+    monkeypatch.setattr(managed_hosts_mod, "_PROVIDER_CLEANUP_EXECUTOR", executor)
+    monkeypatch.setattr(managed_hosts_mod, "_CREDENTIAL_CLEANUP_TIMEOUT_S", 0.05)
+    gates = [threading.Event(), threading.Event()]
+    entered = [threading.Event(), threading.Event()]
+    launcher = FakeSandboxLauncher()
+
+    def blocking_terminate(sandbox_id: str) -> None:
+        index = int(sandbox_id.rsplit("-", 1)[1])
+        entered[index].set()
+        assert gates[index].wait(timeout=5), "test never released the terminate gate"
+
+    monkeypatch.setattr(launcher, "terminate", blocking_terminate)
+    try:
+        results = await asyncio.gather(
+            *(
+                managed_hosts_mod._terminate_sandbox_id_best_effort(
+                    launcher,
+                    sandbox_id=f"sb-hung-{index}",
+                    provider=launcher.provider,
+                    host_id=f"host-{index}",
+                )
+                for index in range(2)
+            )
+        )
+        assert results == [False, False]
+        assert all(event.is_set() for event in entered)
+        assert not await managed_hosts_mod._terminate_sandbox_id_best_effort(
+            launcher,
+            sandbox_id="sb-hung-2",
+            provider=launcher.provider,
+            host_id="host-2",
+        )
+
+        store = HostStore(db_uri)
+        app = _capability_probe_app(db_uri, tmp_path, _hook_config(launcher, None))
+        monkeypatch.setattr(_globals, "_terminal_registry", TerminalRegistry())
+
+        async def probe_startup() -> None:
+            async with app.router.lifespan_context(app):
+                assert (
+                    await asyncio.wait_for(
+                        asyncio.to_thread(store.list_hosts, _OWNER),
+                        timeout=0.5,
+                    )
+                    == []
+                )
+
+        await asyncio.wait_for(probe_startup(), timeout=2)
+    finally:
+        for gate in gates:
+            gate.set()
+        await asyncio.to_thread(executor.shutdown)
 
 
 async def test_cancelled_start_waits_for_provider_worker_before_cleanup(

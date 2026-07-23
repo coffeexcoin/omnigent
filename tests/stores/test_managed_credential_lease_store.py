@@ -344,6 +344,39 @@ def test_active_claim_is_fenced_to_expected_sandbox_generation(db_uri: str) -> N
     assert persisted == {first.generation: "retiring", second.generation: "active"}
 
 
+def test_cleanup_claim_takes_over_expired_retiring_generation(db_uri: str) -> None:
+    """A relaunch retry can reclaim an abandoned predecessor cleanup claim."""
+    store = HostStore(db_uri)
+    _register(store, "sb-generation-1")
+    record = _record(store)
+    store.upsert_on_connect(_HOST_ID, _HOST_NAME, _USER_ID)
+    assert store.activate_credential_lease(
+        _HOST_ID,
+        record.generation,
+        "launch-owner-1",
+        expected_sandbox_id="sb-generation-1",
+    )
+    first_claim = store.claim_active_credential_leases(
+        _HOST_ID,
+        claim_owner="cleanup-1",
+        claim_expires_at=now_epoch() + 120,
+        expected_sandbox_id="sb-generation-1",
+    )
+    assert [row.generation for row in first_claim] == [record.generation]
+
+    _expire_claim(db_uri, record.generation)
+    replacement = store.claim_active_credential_leases(
+        _HOST_ID,
+        claim_owner="cleanup-2",
+        claim_expires_at=now_epoch() + 120,
+        expected_sandbox_id="sb-generation-1",
+    )
+
+    assert [(row.generation, row.claim_owner, row.state) for row in replacement] == [
+        (record.generation, "cleanup-2", "retiring")
+    ]
+
+
 def test_reference_activation_and_release_are_cas_fenced(db_uri: str) -> None:
     """Wrong or stale owners cannot mutate another generation."""
     store = HostStore(db_uri)

@@ -503,7 +503,7 @@ class HostStore:
         claim_expires_at: int,
         expected_sandbox_id: str | None = None,
     ) -> list[CredentialLeaseRecord]:
-        """Atomically claim matching active generations before cleanup."""
+        """Claim active or abandoned cleanup generations for one sandbox."""
         workspace_id = current_workspace_id()
         now = now_epoch()
         if claim_expires_at <= now:
@@ -513,14 +513,28 @@ class HostStore:
             if expected_sandbox_id is None
             else SqlManagedCredentialLease.sandbox_id == expected_sandbox_id
         )
+        active_state = encode_managed_credential_lease_state("active")
+        cleanup_states = (
+            encode_managed_credential_lease_state("retiring"),
+            encode_managed_credential_lease_state("recovering"),
+        )
+        claimable = or_(
+            SqlManagedCredentialLease.state == active_state,
+            and_(
+                SqlManagedCredentialLease.state.in_(cleanup_states),
+                or_(
+                    SqlManagedCredentialLease.claim_expires_at.is_(None),
+                    SqlManagedCredentialLease.claim_expires_at <= now,
+                ),
+            ),
+        )
         with self._write_session() as session:
             rows = session.scalars(
                 select(SqlManagedCredentialLease).where(
                     SqlManagedCredentialLease.workspace_id == workspace_id,
                     SqlManagedCredentialLease.host_id == host_id,
                     sandbox_binding,
-                    SqlManagedCredentialLease.state
-                    == encode_managed_credential_lease_state("active"),
+                    claimable,
                 )
             ).all()
             claimed: list[CredentialLeaseRecord] = []
@@ -532,8 +546,7 @@ class HostStore:
                         SqlManagedCredentialLease.host_id == row.host_id,
                         SqlManagedCredentialLease.generation == row.generation,
                         sandbox_binding,
-                        SqlManagedCredentialLease.state
-                        == encode_managed_credential_lease_state("active"),
+                        claimable,
                     )
                     .values(
                         state=encode_managed_credential_lease_state("retiring"),

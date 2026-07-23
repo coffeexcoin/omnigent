@@ -123,9 +123,11 @@ stores into ``create_app``):
 from __future__ import annotations
 
 import asyncio
+import concurrent.futures
 import logging
 import re
 import secrets
+import threading
 import time
 import uuid
 from collections.abc import Callable
@@ -185,8 +187,49 @@ _CREDENTIAL_PENDING_STALE_S = 300
 _CREDENTIAL_OWNER_RENEW_INTERVAL_S = 30.0
 _CREDENTIAL_RECOVERY_INTERVAL_S = 60.0
 _CREDENTIAL_RECOVERY_BATCH_SIZE = 100
+_PROVIDER_CLEANUP_MAX_WORKERS = 4
 
 _T = TypeVar("_T")
+
+
+class _BoundedProviderCleanupExecutor:
+    """Keep blocking provider cleanup off asyncio's shared executor."""
+
+    def __init__(self, max_workers: int) -> None:
+        self._executor = concurrent.futures.ThreadPoolExecutor(
+            max_workers=max_workers,
+            thread_name_prefix="managed-host-cleanup",
+        )
+        self._slots = threading.BoundedSemaphore(max_workers)
+
+    def submit(
+        self,
+        function: Callable[..., Any],
+        *args: Any,
+    ) -> concurrent.futures.Future[Any] | None:
+        """Submit only when a worker slot is available without queuing."""
+        if not self._slots.acquire(blocking=False):
+            return None
+        try:
+            future = self._executor.submit(function, *args)
+        except BaseException:
+            self._slots.release()
+            raise
+        future.add_done_callback(self._release_slot)
+        return future
+
+    def _release_slot(self, _future: concurrent.futures.Future[Any]) -> None:
+        self._slots.release()
+
+    def shutdown(self) -> None:
+        """Wait for submitted cleanup calls and stop worker threads."""
+        self._executor.shutdown(wait=True, cancel_futures=True)
+
+
+_PROVIDER_CLEANUP_EXECUTOR = _BoundedProviderCleanupExecutor(
+    max_workers=_PROVIDER_CLEANUP_MAX_WORKERS
+)
+
 
 # Launch-token lifetime for the YAML modal path: Modal's 24h sandbox
 # cap plus an hour of slack, so a live sandbox can always
@@ -2028,6 +2071,22 @@ async def relaunch_managed_host(
         claim_expires_at=now_epoch() + _CREDENTIAL_CLAIM_TTL_S,
         expected_sandbox_id=host.sandbox_id,
     )
+    outstanding_predecessors = await asyncio.to_thread(
+        host_store.list_credential_leases,
+        host.host_id,
+    )
+    claimed_generations = {record.generation for record in claimed}
+    if any(
+        record.sandbox_id == host.sandbox_id and record.generation not in claimed_generations
+        for record in outstanding_predecessors
+    ):
+        raise HTTPException(
+            status_code=409,
+            detail=(
+                "Managed-host relaunch deferred while predecessor credential cleanup "
+                "is still owned by another launch or recovery worker. Retry shortly."
+            ),
+        )
     terminated = await _terminate_sandbox_best_effort(launcher, host)
     if not terminated:
         raise HTTPException(
@@ -2041,11 +2100,25 @@ async def relaunch_managed_host(
         host.host_id,
         expected_sandbox_id=host.sandbox_id,
     )
-    await _release_stored_credential_leases(
+    credentials_released = await _release_stored_credential_leases(
         config,
         host_store,
         claimed,
     )
+    remaining_predecessors = await asyncio.to_thread(
+        host_store.list_credential_leases,
+        host.host_id,
+    )
+    if not credentials_released or any(
+        record.sandbox_id == host.sandbox_id for record in remaining_predecessors
+    ):
+        raise HTTPException(
+            status_code=502,
+            detail=(
+                "Managed-host relaunch deferred because predecessor credential cleanup "
+                "did not complete. Retry shortly."
+            ),
+        )
     if not predecessor_revoked:
         raise HTTPException(
             status_code=409,
@@ -2267,9 +2340,10 @@ async def _release_stored_credential_leases(
     config: ManagedSandboxConfig,
     host_store: HostStore,
     records: list[CredentialLeaseRecord],
-) -> None:
+) -> bool:
     """Release claimed rows and CAS-tombstone successful cleanup."""
     hook = config.credential_hook
+    all_released = True
     for record in records:
         if record.claim_owner is None:
             _logger.warning(
@@ -2277,6 +2351,7 @@ async def _release_stored_credential_leases(
                 record.host_id,
                 record.generation,
             )
+            all_released = False
             continue
         claim_owner = record.claim_owner
         renewed_record = await _renew_credential_cleanup_claim(record, host_store)
@@ -2287,6 +2362,7 @@ async def _release_stored_credential_leases(
                 record.host_id,
                 record.generation,
             )
+            all_released = False
             continue
         record = renewed_record
         if record.credential_cleanup_required:
@@ -2297,6 +2373,7 @@ async def _release_stored_credential_leases(
                     record.host_id,
                     record.generation,
                 )
+                all_released = False
                 continue
             context = ManagedCredentialReleaseContext(
                 owner=record.user_id,
@@ -2321,6 +2398,7 @@ async def _release_stored_credential_leases(
                     record.host_id,
                     exc_info=True,
                 )
+                all_released = False
                 continue
         renewed_record = await _renew_credential_cleanup_claim(record, host_store)
         if renewed_record is None:
@@ -2330,6 +2408,7 @@ async def _release_stored_credential_leases(
                 record.host_id,
                 record.generation,
             )
+            all_released = False
             continue
         record = renewed_record
         released = await asyncio.to_thread(
@@ -2344,6 +2423,8 @@ async def _release_stored_credential_leases(
                 record.host_id,
                 record.generation,
             )
+            all_released = False
+    return all_released
 
 
 async def recover_managed_credential_leases(
@@ -3012,9 +3093,19 @@ async def _terminate_sandbox_id_best_effort(
 ) -> bool:
     """Bound one provider termination attempt without discarding retry identity."""
     if launcher is not None:
+        cleanup_future = _PROVIDER_CLEANUP_EXECUTOR.submit(launcher.terminate, sandbox_id)
+        if cleanup_future is None:
+            _logger.warning(
+                "Skipping managed sandbox %s termination (provider=%s) for host %s: "
+                "provider cleanup capacity is exhausted",
+                sandbox_id,
+                provider,
+                host_id,
+            )
+            return False
         try:
             await asyncio.wait_for(
-                asyncio.to_thread(launcher.terminate, sandbox_id),
+                asyncio.wrap_future(cleanup_future),
                 timeout=_CREDENTIAL_CLEANUP_TIMEOUT_S,
             )
             return True
