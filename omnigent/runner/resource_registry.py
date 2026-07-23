@@ -16,8 +16,8 @@ import logging
 import os
 import threading
 import time
-from collections.abc import Callable
-from dataclasses import dataclass
+from collections.abc import Awaitable, Callable, Mapping
+from dataclasses import dataclass, replace
 from enum import Enum
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Literal
@@ -35,6 +35,7 @@ from omnigent.entities.session_resources import (
     terminal_resource_id,
     terminal_resource_view,
 )
+from omnigent.inner.datamodel import TerminalEnvSpec
 
 if TYPE_CHECKING:
     from omnigent.inner.os_env import OSEnvironment
@@ -303,6 +304,15 @@ class SessionResourceRegistry:
         # lifecycle relationship so the runner can decide whether the owning
         # session should fail.
         self._terminal_exit_publisher: Callable[[TerminalExitEvent], None] | None = None
+        # Optional runner-owned overlay for environment values that must reach
+        # every terminal process without becoming part of the portable spec.
+        self._terminal_env_provider: (
+            Callable[
+                [str, Mapping[str, str]],
+                Mapping[str, str] | Awaitable[Mapping[str, str]],
+            ]
+            | None
+        ) = None
         # Strong reference to the fire-and-forget terminal-exit cleanup tasks,
         # plus an event so loop-side callers can await scheduling/completion
         # instead of polling. Entries self-remove on completion.
@@ -364,6 +374,23 @@ class SessionResourceRegistry:
         :param publisher: Callable receiving a :class:`TerminalExitEvent`.
         """
         self._terminal_exit_publisher = publisher
+
+    def set_terminal_env_provider(
+        self,
+        provider: Callable[
+            [str, Mapping[str, str]],
+            Mapping[str, str] | Awaitable[Mapping[str, str]],
+        ],
+    ) -> None:
+        """Install a runner-owned environment overlay for terminal launches.
+
+        The callback receives the session id and the spec's existing explicit
+        environment. Values it returns take precedence without mutating the
+        portable terminal spec supplied by the agent definition.
+
+        :param provider: Sync or async environment-overlay callback.
+        """
+        self._terminal_env_provider = provider
 
     async def wait_for_terminal_exit_cleanup(self) -> None:
         """Await the scheduled terminal-exit cleanup to completion so its
@@ -837,6 +864,13 @@ class SessionResourceRegistry:
         """Launch a terminal, then observe it with the requested lifecycle."""
         if self._terminal_registry is None:
             raise RuntimeError("Terminal registry not configured")
+
+        terminal_env_provider = self._terminal_env_provider
+        if terminal_env_provider is not None and isinstance(spec, TerminalEnvSpec):
+            overlay = terminal_env_provider(session_id, spec.env)
+            if isinstance(overlay, Awaitable):
+                overlay = await overlay
+            spec = replace(spec, env={**spec.env, **overlay})
 
         instance = await self._terminal_registry.launch(
             conversation_id=session_id,
