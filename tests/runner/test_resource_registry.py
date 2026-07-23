@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import os
-from collections.abc import Sequence
+from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 from pathlib import Path
 from types import SimpleNamespace
@@ -221,6 +221,58 @@ async def test_terminal_resource_role_is_private_and_cleared_on_close(
 
     assert closed is True
     assert registry.terminal_resource_role("conv_codex", view.id) is None
+
+
+@pytest.mark.asyncio
+async def test_terminal_launch_applies_runner_owned_environment_overlay(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Runner-owned wrappers reach terminals without mutating portable specs."""
+    terminal_registry = TerminalRegistry()
+    registry = SessionResourceRegistry(terminal_registry=terminal_registry)
+    instance = make_test_terminal_instance("shell", "main", tmp_path)
+    captured: dict[str, TerminalEnvSpec] = {}
+
+    async def _fake_launch(
+        conversation_id: str,
+        terminal_name: str,
+        session_key: str,
+        spec: TerminalEnvSpec,
+        **kwargs: object,
+    ) -> TerminalInstance:
+        del kwargs
+        captured["spec"] = spec
+        terminal_registry._by_conversation.setdefault(conversation_id, {})[
+            (terminal_name, session_key)
+        ] = instance
+        return instance
+
+    async def _overlay(session_id: str, env: Mapping[str, str]) -> dict[str, str]:
+        assert session_id == "conv_wrapped"
+        assert env == {"EXISTING": "portable", "PATH": "/portable/bin"}
+        return {"PATH": "/wrappers:/portable/bin", "BROKER_CAP": "opaque"}
+
+    monkeypatch.setattr(terminal_registry, "launch", _fake_launch)
+    registry.set_terminal_env_provider(_overlay)
+    original = TerminalEnvSpec(
+        command="sh",
+        env={"EXISTING": "portable", "PATH": "/portable/bin"},
+    )
+
+    await registry.launch_auxiliary_terminal(
+        "conv_wrapped",
+        "shell",
+        "main",
+        original,
+    )
+
+    assert original.env == {"EXISTING": "portable", "PATH": "/portable/bin"}
+    assert captured["spec"].env == {
+        "EXISTING": "portable",
+        "PATH": "/wrappers:/portable/bin",
+        "BROKER_CAP": "opaque",
+    }
 
 
 @pytest.mark.asyncio
