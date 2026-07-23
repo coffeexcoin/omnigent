@@ -566,8 +566,8 @@ async def test_evaluate_body_actor_field_is_ignored(
 ) -> None:
     """
     A caller cannot spoof the policy actor by injecting ``context.actor``
-    into the event payload — the body field is ignored; only the
-    server-stashed turn actor (or the request ``user_id``) is used.
+    into the event payload. Only the runner-carried top-level turn actor
+    (or the request ``user_id`` fallback) is used.
     """
     policy = FunctionPolicySpec(
         name="admin__deny_blocked_actor",
@@ -582,7 +582,7 @@ async def test_evaluate_body_actor_field_is_ignored(
             default_policies=[policy],
         ),
     )
-    # HTTP request is unauthenticated; no turn actor stashed server-side.
+    # HTTP request is unauthenticated and carries no top-level turn actor.
     monkeypatch.setattr(
         "omnigent.server.routes.sessions._get_user_id",
         lambda _req, _auth: None,

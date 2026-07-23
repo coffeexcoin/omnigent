@@ -16,6 +16,7 @@ import json
 from dataclasses import dataclass
 from typing import Any
 
+import httpx
 import pytest
 
 from omnigent.entities.conversation import Conversation
@@ -602,7 +603,19 @@ async def test_mcp_proxy_runner_supplied_actor_reaches_policy_engine(
     service-account credential.
     """
     captured: list[EvaluationContext] = []
+    runner_calls: list[dict[str, Any]] = []
     engine = _CapturingPolicyEngine(captured=captured)
+
+    class _CapturingRunnerClient:
+        """Capture the execution payload forwarded back to the runner."""
+
+        async def post(self, path: str, **kwargs: Any) -> httpx.Response:
+            runner_calls.append({"path": path, **kwargs})
+            return httpx.Response(
+                200,
+                json={"result": {"content": []}},
+                request=httpx.Request("POST", f"http://runner{path}"),
+            )
 
     monkeypatch.setattr(
         sessions_mod,
@@ -613,6 +626,18 @@ async def test_mcp_proxy_runner_supplied_actor_reaches_policy_engine(
         sessions_mod,
         "_build_policy_engine_from_spec",
         lambda spec, session_id, conversation_store: engine,
+    )
+
+    async def _get_capturing_runner_client(
+        session_id: str,
+        runner_router: Any,
+    ) -> _CapturingRunnerClient:
+        return _CapturingRunnerClient()
+
+    monkeypatch.setattr(
+        sessions_mod,
+        "_get_runner_client",
+        _get_capturing_runner_client,
     )
 
     params = {"name": "sys_os_shell", "arguments": {"command": "echo hi"}}
@@ -630,3 +655,4 @@ async def test_mcp_proxy_runner_supplied_actor_reaches_policy_engine(
     assert captured[0].actor == {"run_as": "alice@example.com"}, (
         f"expected actor from runner body, got: {captured[0].actor!r}"
     )
+    assert runner_calls[0]["json"]["actor"] == {"run_as": "alice@example.com"}
