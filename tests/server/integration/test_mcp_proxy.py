@@ -193,21 +193,13 @@ async def test_mcp_tools_call_missing_name_returns_error(
 async def test_mcp_nonexistent_session_returns_error(
     client: httpx.AsyncClient,
 ) -> None:
-    """MCP on a nonexistent session returns an error.
-
-    The session lookup (``_require_access``) runs before the JSON-RPC
-    dispatch.  Without a permission store the access check is a no-op,
-    so the request reaches the JSON-RPC layer.  ``tools/list`` then
-    fails with "No runner bound" because the tunnel registry has no
-    binding for the nonexistent session.
-    """
+    """MCP actor validation fails closed when the session does not exist."""
     resp = await _post_mcp(
         client,
         "3628cfc9b00f747da23485e2534458a6",
         _jsonrpc("tools/list", rpc_id=10),
     )
-    assert resp.status_code == 200
+    assert resp.status_code == 404
     payload = resp.json()
-    assert payload["id"] == 10
-    assert payload["error"]["code"] == -32000
-    assert "No runner bound" in payload["error"]["message"]
+    assert payload["error"]["code"] == "not_found"
+    assert "not found" in payload["error"]["message"].lower()

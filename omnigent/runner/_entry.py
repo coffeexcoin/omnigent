@@ -32,6 +32,7 @@ if TYPE_CHECKING:
     from types import TracebackType
 
     from omnigent.runner.app import ResolvedSpec
+    from omnigent.runner.mcp_credentials import McpCredentialResolver
     from omnigent.runner.transports.ws_tunnel.serve import _ASGIApp
 
 _RUNNER_SERVER_URL_ENV_VAR = "RUNNER_SERVER_URL"
@@ -980,6 +981,7 @@ async def _resolve_agent_spec_from_server(
 
 def create_app(
     auth_token_factory: Callable[[], str | None] | None = None,
+    mcp_credential_resolver: McpCredentialResolver | None = None,
 ) -> FastAPI:
     """Factory for the runner FastAPI app exposing the harness-contract subset.
 
@@ -987,6 +989,8 @@ def create_app(
         HTTP client and native terminal helpers, e.g. the delegated factory
         ``_run_tunnel_from_env`` already built for the WS tunnel. When ``None``,
         the app builds its own.
+    :param mcp_credential_resolver: Optional deployment hook for actor-aware
+        HTTP and stdio MCP credentials.
     :returns: A runner FastAPI app exposing the harness-contract subset.
     """
     from omnigent.runner.app import create_runner_app
@@ -1061,6 +1065,7 @@ def create_app(
     mcp_manager = RunnerMcpManager(
         stdio_cwd=runner_workspace,
         server_client=server_client,
+        credential_resolver=mcp_credential_resolver,
     )
 
     # Stable extraction root for spec_resolver; bundles get

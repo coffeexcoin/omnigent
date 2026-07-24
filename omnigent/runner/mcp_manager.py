@@ -8,13 +8,15 @@ import hashlib
 import json
 import logging
 from collections.abc import Awaitable, Callable
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from pathlib import Path
 from typing import Any
 
 from mcp.types import ElicitRequestParams, ElicitResult
 from mcp.types import Tool as McpToolDef
 
+from omnigent.policies.schema import ActorContext
+from omnigent.runner.mcp_credentials import McpCredential, McpCredentialResolver
 from omnigent.spec.types import AgentSpec, MCPServerConfig
 from omnigent.tools.base import is_valid_tool_name
 from omnigent.tools.mcp import McpServerConnection
@@ -50,7 +52,7 @@ class _SharedServerEntry:
     """One live MCP server connection shared by any spec with the same config."""
 
     server_hash: str
-    config: MCPServerConfig
+    config: MCPServerConfig = field(repr=False)
     connection: McpServerConnection | None = None
     tools: list[McpToolDef] = field(default_factory=list)
     error: str | None = None
@@ -76,6 +78,16 @@ class _SpecEntry:
 
 
 @dataclass(frozen=True)
+class _ResolvedServerConfig:
+    """Base config plus request-resolved transport credentials and pool key."""
+
+    base: MCPServerConfig
+    effective: MCPServerConfig = field(repr=False)
+    credential_key: str | None = None
+    stdio_actor_partition: str | None = None
+
+
+@dataclass(frozen=True)
 class McpSchemasResult:
     """Output of :meth:`RunnerMcpManager.schemas_for`."""
 
@@ -84,28 +96,35 @@ class McpSchemasResult:
     failures: dict[str, str]  # server_name → error message
 
 
-def compute_spec_hash(configs: list[MCPServerConfig], cwd: Path | None = None) -> str:
+def compute_spec_hash(
+    configs: list[MCPServerConfig],
+    cwd: Path | None = None,
+    credential_keys: list[str | None] | None = None,
+) -> str:
     """Stable content hash over ``spec.mcp_servers`` (+ stdio cwd)."""
+    hash_payload: dict[str, Any] = {
+        "cwd": str(cwd) if cwd is not None else None,
+        "servers": [
+            {
+                "name": c.name,
+                "transport": c.transport,
+                "url": c.url,
+                "headers": dict(c.headers or {}),
+                "databricks_profile": c.databricks_profile,
+                "command": c.command,
+                "args": list(c.args or []),
+                "env": dict(c.env or {}),
+                "tools": list(getattr(c, "tools", None) or []),
+                "timeout": c.timeout,
+                "retry": _retry_payload(c.retry),
+            }
+            for c in configs
+        ],
+    }
+    if credential_keys is not None:
+        hash_payload["credential_keys"] = credential_keys
     payload = json.dumps(
-        {
-            "cwd": str(cwd) if cwd is not None else None,
-            "servers": [
-                {
-                    "name": c.name,
-                    "transport": c.transport,
-                    "url": c.url,
-                    "headers": dict(c.headers or {}),
-                    "databricks_profile": c.databricks_profile,
-                    "command": c.command,
-                    "args": list(c.args or []),
-                    "env": dict(c.env or {}),
-                    "tools": list(getattr(c, "tools", None) or []),
-                    "timeout": c.timeout,
-                    "retry": _retry_payload(c.retry),
-                }
-                for c in configs
-            ],
-        },
+        hash_payload,
         sort_keys=True,
         separators=(",", ":"),
     )
@@ -122,26 +141,33 @@ def _retry_payload(retry: Any | None) -> Any:
     return repr(retry)
 
 
-def compute_server_hash(config: MCPServerConfig, cwd: Path | None = None) -> str:
+def compute_server_hash(
+    config: MCPServerConfig,
+    cwd: Path | None = None,
+    credential_key: str | None = None,
+) -> str:
     """Stable content hash over fields that determine one MCP connection.
 
     ``name`` and ``tools`` are intentionally excluded: two specs can expose
     the same underlying server with different namespaces or allow-lists while
     sharing one transport/subprocess.
     """
+    hash_payload: dict[str, Any] = {
+        "cwd": str(cwd) if config.transport == "stdio" and cwd is not None else None,
+        "transport": config.transport,
+        "url": config.url,
+        "headers": dict(config.headers or {}),
+        "databricks_profile": config.databricks_profile,
+        "command": config.command,
+        "args": list(config.args or []),
+        "env": dict(config.env or {}),
+        "timeout": config.timeout,
+        "retry": _retry_payload(config.retry),
+    }
+    if credential_key is not None:
+        hash_payload["credential_key"] = credential_key
     payload = json.dumps(
-        {
-            "cwd": str(cwd) if config.transport == "stdio" and cwd is not None else None,
-            "transport": config.transport,
-            "url": config.url,
-            "headers": dict(config.headers or {}),
-            "databricks_profile": config.databricks_profile,
-            "command": config.command,
-            "args": list(config.args or []),
-            "env": dict(config.env or {}),
-            "timeout": config.timeout,
-            "retry": _retry_payload(config.retry),
-        },
+        hash_payload,
         sort_keys=True,
         separators=(",", ":"),
     )
@@ -214,6 +240,7 @@ class RunnerMcpManager:
         self,
         stdio_cwd: Path | None = None,
         server_client: Any | None = None,
+        credential_resolver: McpCredentialResolver | None = None,
     ) -> None:
         """
         :param stdio_cwd: Working directory for spawned stdio MCP
@@ -222,6 +249,8 @@ class RunnerMcpManager:
             Omnigent server. When provided, inline MCP elicitations are
             surfaced to the user via the Omnigent server's session events
             API. When ``None``, inline elicitations are declined.
+        :param credential_resolver: Optional deployment hook that resolves
+            actor- or service-scoped credentials for every MCP request.
         """
         self._specs: dict[str, _SpecEntry] = {}
         self._servers: dict[str, _SharedServerEntry] = {}
@@ -230,8 +259,12 @@ class RunnerMcpManager:
         # Hold strong refs to fire-and-forget eviction-close tasks so
         # the GC doesn't cancel them mid-flight (RUF006).
         self._evict_tasks: set[asyncio.Task[None]] = set()
+        # Current connector for each actor-scoped (session, stdio server)
+        # partition. Takeover retires only the affected connector process.
+        self._stdio_actor_servers: dict[str, str] = {}
         self._stdio_cwd = stdio_cwd
         self._server_client = server_client
+        self._credential_resolver = credential_resolver
 
     def _build_elicitation_callback(
         self,
@@ -330,6 +363,136 @@ class RunnerMcpManager:
 
         return _elicit
 
+    @staticmethod
+    def _static_resolved_configs(
+        configs: list[MCPServerConfig],
+    ) -> list[_ResolvedServerConfig]:
+        """Wrap static configs without changing legacy pooling behavior."""
+        return [_ResolvedServerConfig(base=config, effective=config) for config in configs]
+
+    def _resolved_spec_hash(self, resolved: list[_ResolvedServerConfig]) -> str:
+        """Hash base spec fields plus non-secret credential partitions."""
+        credential_keys = [item.credential_key for item in resolved]
+        return compute_spec_hash(
+            [item.base for item in resolved],
+            self._stdio_cwd,
+            credential_keys if any(key is not None for key in credential_keys) else None,
+        )
+
+    async def _resolve_configs(
+        self,
+        configs: list[MCPServerConfig],
+        actor: ActorContext | None,
+        session_id: str | None,
+    ) -> list[_ResolvedServerConfig]:
+        """Resolve transport credentials for one MCP request."""
+        resolver = self._credential_resolver
+        if resolver is None:
+            return self._static_resolved_configs(configs)
+
+        resolved: list[_ResolvedServerConfig] = []
+        actor_snapshot = actor.copy() if actor is not None else None
+        for config in configs:
+            credential = await resolver.resolve(
+                config,
+                actor_snapshot.copy() if actor_snapshot is not None else None,
+            )
+            if credential is None:
+                resolved.append(_ResolvedServerConfig(base=config, effective=config))
+                continue
+            effective = self._apply_credential(config, credential)
+            credential_key = self._credential_pool_key(
+                config,
+                credential,
+                actor_snapshot,
+                session_id,
+            )
+            stdio_actor_partition = None
+            if config.transport == "stdio" and credential.scope == "actor":
+                assert session_id is not None
+                static_server_hash = compute_server_hash(config, self._stdio_cwd)
+                stdio_actor_partition = f"{session_id}:{static_server_hash}"
+            resolved.append(
+                _ResolvedServerConfig(
+                    base=config,
+                    effective=effective,
+                    credential_key=credential_key,
+                    stdio_actor_partition=stdio_actor_partition,
+                )
+            )
+        return resolved
+
+    @staticmethod
+    def _apply_credential(
+        config: MCPServerConfig,
+        credential: McpCredential,
+    ) -> MCPServerConfig:
+        """Merge credential material into a copied transport config."""
+        if config.transport == "http":
+            if credential.env:
+                raise ValueError(
+                    f"HTTP MCP server {config.name!r} credential resolver returned stdio env"
+                )
+            headers = dict(config.headers or {})
+            headers.update(credential.headers)
+            return replace(config, headers=headers)
+        if config.transport == "stdio":
+            if credential.headers:
+                raise ValueError(
+                    f"stdio MCP server {config.name!r} credential resolver returned HTTP headers"
+                )
+            env = dict(config.env or {})
+            env.update(credential.env)
+            return replace(config, env=env)
+        raise ValueError(f"unsupported MCP transport {config.transport!r}")
+
+    @staticmethod
+    def _credential_pool_key(
+        config: MCPServerConfig,
+        credential: McpCredential,
+        actor: ActorContext | None,
+        session_id: str | None,
+    ) -> str:
+        """Build the non-secret identity/generation connector partition."""
+        if credential.scope == "service":
+            return f"service:{credential.identity}:{credential.generation}"
+        if actor is None:
+            raise ValueError("actor-scoped MCP credentials require an active actor")
+        actor_key = json.dumps(dict(actor), sort_keys=True, separators=(",", ":"))
+        if config.transport == "stdio":
+            if session_id is None:
+                raise ValueError("actor-scoped stdio MCP credentials require an active session")
+            return f"session:{session_id}:actor:{actor_key}:{credential.generation}"
+        return f"actor:{actor_key}:{credential.generation}"
+
+    def _retire_replaced_stdio_connectors(
+        self,
+        resolved: list[_ResolvedServerConfig],
+    ) -> None:
+        """Retire stale actor-scoped stdio connectors. Caller holds ``self._lock``."""
+        for item in resolved:
+            partition = item.stdio_actor_partition
+            if partition is None:
+                continue
+            current_hash = compute_server_hash(
+                item.base,
+                self._stdio_cwd,
+                item.credential_key,
+            )
+            previous_hash = self._stdio_actor_servers.get(partition)
+            if previous_hash is not None and previous_hash != current_hash:
+                victims = [
+                    spec_hash
+                    for spec_hash, entry in self._specs.items()
+                    if previous_hash in entry.server_hashes
+                ]
+                for spec_hash in victims:
+                    entry = self._specs.pop(spec_hash)
+                    with contextlib.suppress(ValueError):
+                        self._lru.remove(spec_hash)
+                    self._release_spec_entry(spec_hash, entry)
+            self._stdio_actor_servers[partition] = current_hash
+
     async def prewarm(self, spec: AgentSpec) -> None:
         """Register *spec*'s MCPs without spawning transports.
 
@@ -339,19 +502,38 @@ class RunnerMcpManager:
         configs = list(spec.mcp_servers or [])
         if not configs:
             return
+        # Credential scope is known only at a real turn boundary. Avoid
+        # registering an uncredentialed connector that a later actor-scoped
+        # request could accidentally reuse.
+        if self._credential_resolver is not None:
+            return
         spec_hash = compute_spec_hash(configs, self._stdio_cwd)
         async with self._lock:
-            self._ensure_entry(spec_hash, configs)
+            self._ensure_entry(spec_hash, self._static_resolved_configs(configs))
             self._touch(spec_hash)
 
-    async def schemas_for(self, spec: AgentSpec) -> McpSchemasResult:
-        """Resolve MCP schemas for *spec*; awaits any in-flight connect."""
+    async def schemas_for(
+        self,
+        spec: AgentSpec,
+        actor: ActorContext | None = None,
+        session_id: str | None = None,
+    ) -> McpSchemasResult:
+        """Resolve MCP schemas for *spec* using the active actor credential."""
         configs = list(spec.mcp_servers or [])
         if not configs:
             return McpSchemasResult(schemas=[], tool_names=set(), failures={})
-        spec_hash = compute_spec_hash(configs, self._stdio_cwd)
+        resolved = await self._resolve_configs(configs, actor, session_id)
+        return await self._schemas_for_resolved(resolved)
+
+    async def _schemas_for_resolved(
+        self,
+        resolved: list[_ResolvedServerConfig],
+    ) -> McpSchemasResult:
+        """Resolve schemas using one already-resolved credential snapshot."""
+        spec_hash = self._resolved_spec_hash(resolved)
         async with self._lock:
-            entry = self._ensure_entry(spec_hash, configs)
+            self._retire_replaced_stdio_connectors(resolved)
+            entry = self._ensure_entry(spec_hash, resolved)
             self._touch(spec_hash)
             refs = list(entry.servers.values())
             for ref in refs:
@@ -396,6 +578,7 @@ class RunnerMcpManager:
         tool_name: str,
         arguments: dict[str, Any],
         session_id: str | None = None,
+        actor: ActorContext | None = None,
     ) -> str:
         """
         Dispatch *tool_name* against the pool's cached MCP session.
@@ -407,6 +590,7 @@ class RunnerMcpManager:
         :param session_id: Omnigent session id, e.g. ``"conv_abc123"``.
             Forwarded to the connection for inline elicitation
             context. ``None`` when no session is available.
+        :param actor: Authenticated actor pinned to the active turn.
         :returns: Tool result string.
         :raises McpElicitationRequired: When the MCP server returns
             an ``InputRequiredResult`` requiring user input before
@@ -417,12 +601,14 @@ class RunnerMcpManager:
             raise RuntimeError(
                 f"runner has no MCPs registered for this spec; cannot dispatch {tool_name!r}"
             )
-        spec_hash = compute_spec_hash(configs, self._stdio_cwd)
+        resolved = await self._resolve_configs(configs, actor, session_id)
+        spec_hash = self._resolved_spec_hash(resolved)
         server_to_release: _SharedServerEntry | None = None
         try:
             if "__" in tool_name:
                 async with self._lock:
-                    entry = self._ensure_entry(spec_hash, configs)
+                    self._retire_replaced_stdio_connectors(resolved)
+                    entry = self._ensure_entry(spec_hash, resolved)
                     self._touch(spec_hash)
                     route_ref = self._resolve_tool_ref(entry, tool_name)
                     if route_ref is None:
@@ -443,7 +629,7 @@ class RunnerMcpManager:
                 else:
                     route = None
             else:
-                await self.schemas_for(spec)
+                await self._schemas_for_resolved(resolved)
                 async with self._lock:
                     entry = self._specs.get(spec_hash)
                     route = (
@@ -465,6 +651,57 @@ class RunnerMcpManager:
                 bare_name,
                 arguments,
                 session_id=session_id,
+            )
+        finally:
+            if server_to_release is not None:
+                async with self._lock:
+                    self._release_server_ref(server_to_release, spec_hash)
+
+    async def call_tool_with_elicitation(
+        self,
+        spec: AgentSpec,
+        tool_name: str,
+        arguments: dict[str, Any],
+        *,
+        input_responses: dict[str, Any],
+        request_state: str | None,
+        session_id: str | None = None,
+        actor: ActorContext | None = None,
+    ) -> str:
+        """Dispatch an MRTR retry through the actor-scoped connector pool."""
+        configs = list(spec.mcp_servers or [])
+        if not configs:
+            raise RuntimeError(
+                f"runner has no MCPs registered for this spec; cannot dispatch {tool_name!r}"
+            )
+        resolved = await self._resolve_configs(configs, actor, session_id)
+        spec_hash = self._resolved_spec_hash(resolved)
+        server_to_release: _SharedServerEntry | None = None
+        try:
+            async with self._lock:
+                self._retire_replaced_stdio_connectors(resolved)
+                entry = self._ensure_entry(spec_hash, resolved)
+                self._touch(spec_hash)
+                route_ref = self._resolve_tool_ref(entry, tool_name)
+                if route_ref is None:
+                    raise RuntimeError(f"runner has no live MCP serving tool {tool_name!r}")
+                ref, bare_name = route_ref
+                self._retain_server_ref(ref.entry)
+                server_to_release = ref.entry
+                connect_task = self._ensure_connect_task(ref.entry, entry.spec_hash)
+            if connect_task is not None:
+                await connect_task
+            if (
+                ref.entry.error is not None
+                or ref.entry.connection is None
+                or not self._server_has_allowed_tool(ref, bare_name)
+            ):
+                raise RuntimeError(f"runner has no live MCP serving tool {tool_name!r}")
+            return await ref.entry.connection.call_tool_with_elicitation(
+                bare_name,
+                arguments,
+                input_responses=input_responses,
+                request_state=request_state,
             )
         finally:
             if server_to_release is not None:
@@ -589,6 +826,7 @@ class RunnerMcpManager:
             self._specs.clear()
             self._servers.clear()
             self._lru.clear()
+            self._stdio_actor_servers.clear()
             for task in connect_tasks:
                 task.cancel()
 
@@ -613,17 +851,29 @@ class RunnerMcpManager:
         if self._evict_tasks:
             await asyncio.gather(*list(self._evict_tasks), return_exceptions=True)
 
-    def _ensure_entry(self, spec_hash: str, configs: list[MCPServerConfig]) -> _SpecEntry:
+    def _ensure_entry(
+        self,
+        spec_hash: str,
+        configs: list[_ResolvedServerConfig],
+    ) -> _SpecEntry:
         """Return or create the pool entry for *spec_hash*. Caller holds lock."""
         entry = self._specs.get(spec_hash)
         if entry is not None:
             return entry
         entry = _SpecEntry(spec_hash=spec_hash)
-        for cfg in configs:
-            server_hash = compute_server_hash(cfg, self._stdio_cwd)
+        for resolved in configs:
+            cfg = resolved.base
+            server_hash = compute_server_hash(
+                cfg,
+                self._stdio_cwd,
+                resolved.credential_key,
+            )
             server = self._servers.get(server_hash)
             if server is None:
-                server = _SharedServerEntry(server_hash=server_hash, config=cfg)
+                server = _SharedServerEntry(
+                    server_hash=server_hash,
+                    config=resolved.effective,
+                )
                 self._servers[server_hash] = server
             if server_hash not in entry.server_hashes:
                 server.ref_count += 1
