@@ -19018,6 +19018,13 @@ def create_runner_app(
             )
         method: str = body.get("method") or ""
         params: dict[str, Any] = body.get("params") or {}
+        try:
+            actor = validate_actor_context(body.get("actor"))
+        except ValueError as exc:
+            return JSONResponse(
+                status_code=400,
+                content={"error": {"code": -32602, "message": str(exc)}},
+            )
 
         if method == "tools/list":
             # Resolve the agent spec from the session cache, falling
@@ -19054,7 +19061,14 @@ def create_runner_app(
                     },
                 )
             try:
-                result = await mcp_manager.schemas_for(spec)
+                if actor is None:
+                    result = await mcp_manager.schemas_for(spec)
+                else:
+                    result = await mcp_manager.schemas_for(
+                        spec,
+                        actor=actor,
+                        session_id=session_id,
+                    )
             except Exception as exc:  # noqa: BLE001
                 return JSONResponse(
                     status_code=200,
@@ -19138,29 +19152,49 @@ def create_runner_app(
                         # MRTR retry: the Omnigent server already showed the
                         # elicitation and gathered the user's response.
                         # Forward to the MCP server with inputResponses.
-                        route = mcp_manager._resolve_tool_route(spec, tool_name)
-                        if route is None:
-                            raise RuntimeError(
-                                f"runner has no live MCP serving tool {tool_name!r}"
+                        if actor is not None:
+                            output = await mcp_manager.call_tool_with_elicitation(
+                                spec,
+                                str(tool_name),
+                                arguments,
+                                input_responses=input_responses,
+                                request_state=request_state,
+                                session_id=session_id,
+                                actor=actor,
                             )
-                        owning, bare_tool = route
-                        if owning.connection is None:
-                            raise RuntimeError(
-                                f"runner has no live MCP serving tool {tool_name!r}"
+                        else:
+                            route = mcp_manager._resolve_tool_route(spec, tool_name)
+                            if route is None:
+                                raise RuntimeError(
+                                    f"runner has no live MCP serving tool {tool_name!r}"
+                                )
+                            owning, bare_tool = route
+                            if owning.connection is None:
+                                raise RuntimeError(
+                                    f"runner has no live MCP serving tool {tool_name!r}"
+                                )
+                            output = await owning.connection.call_tool_with_elicitation(
+                                bare_tool,
+                                arguments,
+                                input_responses=input_responses,
+                                request_state=request_state,
                             )
-                        output = await owning.connection.call_tool_with_elicitation(
-                            bare_tool,
-                            arguments,
-                            input_responses=input_responses,
-                            request_state=request_state,
-                        )
                     else:
-                        output = await mcp_manager.call_tool(
-                            spec,
-                            tool_name,
-                            arguments,
-                            session_id=session_id,
-                        )
+                        if actor is None:
+                            output = await mcp_manager.call_tool(
+                                spec,
+                                tool_name,
+                                arguments,
+                                session_id=session_id,
+                            )
+                        else:
+                            output = await mcp_manager.call_tool(
+                                spec,
+                                tool_name,
+                                arguments,
+                                session_id=session_id,
+                                actor=actor,
+                            )
                 except McpElicitationRequired as elicit:
                     # The external MCP server returned InputRequiredResult
                     # (MRTR). Pass it back to the Omnigent server so it can

@@ -21,6 +21,7 @@ from typing import Any
 import httpx
 import pytest
 
+from omnigent.policies.schema import ActorContext
 from omnigent.runner.mcp_manager import McpSchemasResult
 from omnigent.runner.proxy_mcp_manager import ProxyMcpManager
 from omnigent.spec.types import AgentSpec, MCPServerConfig
@@ -157,6 +158,66 @@ async def test_tool_calls_pin_actor_to_manager_turn() -> None:
         {"run_as": "alice@example.com"},
         {"run_as": "bob@example.com"},
     ]
+
+
+@pytest.mark.asyncio
+async def test_approval_retry_keeps_pinned_actor(monkeypatch: pytest.MonkeyPatch) -> None:
+    """An MRTR retry must not drop or rebind the turn actor."""
+    elicitation = _json_resp(
+        {
+            "jsonrpc": "2.0",
+            "id": 1,
+            "result": {
+                "resultType": "input_required",
+                "requestState": "opaque-state",
+                "inputRequests": {"approval-1": {}},
+            },
+        }
+    )
+    ok = _json_resp(
+        {
+            "jsonrpc": "2.0",
+            "id": 2,
+            "result": {"content": [{"type": "text", "text": "approved"}]},
+        }
+    )
+    transport = _StubTransport([elicitation, ok])
+    client = httpx.AsyncClient(transport=transport, base_url="http://ap-server")
+    manager = ProxyMcpManager(
+        "conv_test",
+        client,
+        actor={"run_as": "alice@example.com"},
+    )
+
+    async def _approve(**_kwargs: Any) -> bool:
+        return True
+
+    monkeypatch.setattr(
+        "omnigent.runner.proxy_mcp_manager.pending_approvals.wait_for_user_approval",
+        _approve,
+    )
+
+    assert await manager.call_tool(None, "github__write", {}) == "approved"
+    assert [call.body["actor"] for call in transport.calls] == [
+        {"run_as": "alice@example.com"},
+        {"run_as": "alice@example.com"},
+    ]
+    assert transport.calls[1].body["params"]["requestState"] == "opaque-state"
+
+
+@pytest.mark.asyncio
+async def test_schema_lookup_pins_actor_to_manager_turn() -> None:
+    """Credentialed tools/list must carry the same pinned turn actor as tools/call."""
+    rpc_resp = _json_resp({"jsonrpc": "2.0", "id": 1, "result": {"tools": []}})
+    transport = _StubTransport([rpc_resp])
+    client = httpx.AsyncClient(transport=transport, base_url="http://ap-server")
+    actor: ActorContext = {"run_as": "alice@example.com"}
+    manager = ProxyMcpManager("conv_test", client, actor=actor)
+    actor["run_as"] = "bob@example.com"
+
+    await manager.schemas_for(_make_spec("github"))
+
+    assert transport.calls[0].body["actor"] == {"run_as": "alice@example.com"}
 
 
 @pytest.mark.asyncio

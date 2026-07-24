@@ -118,6 +118,8 @@ class ProxyMcpManager:
             "method": "tools/list",
             "params": {},
         }
+        if self._actor is not None:
+            payload["actor"] = self._actor
         try:
             resp = await self._omnigent_client.post(
                 self._mcp_url,
@@ -306,6 +308,8 @@ class ProxyMcpManager:
                         },
                     },
                 }
+                if self._actor is not None:
+                    payload["actor"] = self._actor
                 continue
 
             # ── Normal result (ALLOW or post-approval execution) ──────────
