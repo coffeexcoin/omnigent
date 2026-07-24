@@ -211,6 +211,7 @@ def _to_conversation(
         ),
         pending_elicitation_count=meta.pending_elicitation_count if meta else None,
         project_id=meta.project_id if meta else None,
+        team_id=meta.team_id if meta else None,
     )
 
 
@@ -1144,11 +1145,11 @@ class SqlAlchemyConversationStore(ConversationStore):
             # too — _to_conversation reads ORM columns, which would raise
             # DetachedInstanceError once the session closes.
             labels_by_conv = _fetch_labels_bulk(session, [row.id for row in rows])
-        meta_rows = []
+        meta_rows: list[SqlConversationMetadata] = []
         if rows:
             row_ids = [r.id for r in rows]
             with self._session() as meta_sess:
-                meta_rows = (
+                meta_rows = list(
                     meta_sess.execute(
                         select(SqlConversationMetadata).where(
                             SqlConversationMetadata.workspace_id == current_workspace_id(),
@@ -1325,6 +1326,23 @@ class SqlAlchemyConversationStore(ConversationStore):
                     SqlConversationMetadata.id == conversation_id,
                 )
                 .values(project_id=project_id)
+            )
+            return result.rowcount > 0
+
+    def set_conversation_team(
+        self,
+        conversation_id: str,
+        team_id: str | None,
+    ) -> bool:
+        """Assign or clear a conversation's team discovery scope."""
+        with self._session() as session:
+            result = session.execute(
+                update(SqlConversationMetadata)
+                .where(
+                    SqlConversationMetadata.workspace_id == current_workspace_id(),
+                    SqlConversationMetadata.id == conversation_id,
+                )
+                .values(team_id=team_id)
             )
             return result.rowcount > 0
 
@@ -2061,6 +2079,7 @@ class SqlAlchemyConversationStore(ConversationStore):
         include_archived: bool = False,
         project: str | None = None,
         title: str | None = None,
+        team_id: str | None = None,
     ) -> PagedList[Conversation]:
         """
         List conversations with cursor-based pagination.
@@ -2117,6 +2136,8 @@ class SqlAlchemyConversationStore(ConversationStore):
             (an ``owner``-level grant) — stricter than ``accessible_by``,
             which also matches sessions merely shared with them. Powers
             the per-project folder fetch. ``None`` disables the filter.
+        :param team_id: Optional session team scope. This is intersected with
+            any permission filters; team scope itself does not grant access.
         :returns: A :class:`PagedList` of :class:`Conversation`
             objects.
         """
@@ -2138,19 +2159,21 @@ class SqlAlchemyConversationStore(ConversationStore):
 
         # kind and archived both live on the AP ``conversations`` table now
         # (kind derived from parent-nullness, archived a real column), so they
-        # are filtered directly on the AP query below. The only filters that
-        # still require an Omnigent-side prefetch are the permission scopes.
-        needs_meta_filter = (accessible_by is not None) or (owned_by is not None)
+        # are filtered directly on the AP query below. Permission and team
+        # scopes require an Omnigent-side prefetch.
+        needs_meta_filter = (
+            (accessible_by is not None) or (owned_by is not None) or (team_id is not None)
+        )
 
         qualifying_ids: list[str] | None = None
         if needs_meta_filter:
-            # Pre-fetch permission-qualifying IDs from the Omnigent DB
-            # (session_permissions), then filter the AP query. accessible_by and
-            # owned_by are intersected (both applied) to match the prior
-            # behaviour. (ACL pushdown to a single AP query is a follow-up.)
+            # Pre-fetch qualifying IDs from the Omnigent DB, then filter the AP
+            # query. Every requested scope is intersected. Team classification
+            # is deliberately independent from the direct session ACL.
             with self._session() as meta_sess:
                 accessible_set: set[str] | None = None
                 owned_set: set[str] | None = None
+                team_set: set[str] | None = None
                 if accessible_by is not None:
                     accessible_set = set(
                         meta_sess.execute(
@@ -2170,12 +2193,21 @@ class SqlAlchemyConversationStore(ConversationStore):
                             )
                         ).scalars()
                     )
-                if accessible_set is not None and owned_set is not None:
-                    qualifying_ids = list(accessible_set & owned_set)
-                else:
-                    qualifying_ids = list(
-                        accessible_set if accessible_set is not None else owned_set or set()
+                if team_id is not None:
+                    team_set = set(
+                        meta_sess.execute(
+                            select(SqlConversationMetadata.id).where(
+                                SqlConversationMetadata.workspace_id == current_workspace_id(),
+                                SqlConversationMetadata.team_id == team_id,
+                            )
+                        ).scalars()
                     )
+                filters = [
+                    values
+                    for values in (accessible_set, owned_set, team_set)
+                    if values is not None
+                ]
+                qualifying_ids = list(set.intersection(*filters)) if filters else []
 
         with self._conv_session() as session:
             stmt = select(SqlConversation).where(

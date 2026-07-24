@@ -1845,6 +1845,8 @@ class SessionResponse(BaseModel):
     # ``labels``); set/cleared via ``PATCH /v1/sessions/{id}`` and filtered on
     # ``GET /v1/sessions?project=``.
     project_id: str | None = None
+    # Team discovery scope; classification only, not an access grant.
+    team_id: str | None = None
 
 
 class UpdateSessionRequest(BaseModel):
@@ -1922,6 +1924,9 @@ class UpdateSessionRequest(BaseModel):
         owner-private, only the session owner may file it, and only into a
         project they own — the server verifies both. Independent of the
         legacy ``omni_project`` label, which is set via ``labels``.
+    :param team_id: Team id to scope this session under. Only the owner may
+        change it, and only to a team they belong to. ``""`` clears the scope.
+        Omitting the field leaves it unchanged; explicit ``null`` is invalid.
     """
 
     runner_id: str | None = None
@@ -1935,6 +1940,7 @@ class UpdateSessionRequest(BaseModel):
     terminal_launch_args: list[str] | None = None
     archived: bool | None = None
     project_id: str | None = None
+    team_id: str | None = None
     silent: bool = False
 
     model_config = ConfigDict(extra="forbid")
@@ -2276,6 +2282,8 @@ class SessionListItem(BaseModel):
     # unfiled. Lets the sidebar group sessions by project without a follow-up
     # GET. Distinct from the legacy ``omni_project`` label in ``labels``.
     project_id: str | None = None
+    # Optional team discovery scope; does not imply team-member access.
+    team_id: str | None = None
 
 
 class SessionList(BaseModel):

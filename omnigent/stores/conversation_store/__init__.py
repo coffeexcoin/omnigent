@@ -555,6 +555,7 @@ class ConversationStore(ABC):
         include_archived: bool = False,
         project: str | None = None,
         title: str | None = None,
+        team_id: str | None = None,
     ) -> PagedList[Conversation]:
         """
         List conversations with cursor-based pagination.
@@ -659,6 +660,9 @@ class ConversationStore(ABC):
             Powers the ``(agent, title)`` child-session lookup in
             ``sys_session_send`` so the server can resolve the target
             in a single indexed query instead of fetching all children.
+        :param team_id: When set, filter to sessions carrying this team
+            discovery scope. Authorization is independent; callers should
+            combine this with ``accessible_by`` for user-facing listings.
         :returns: A :class:`PagedList` of :class:`Conversation`
             objects.
         """
@@ -927,6 +931,22 @@ class ConversationStore(ABC):
             conversation has no metadata row.
         """
         ...
+
+    def set_conversation_team(
+        self,
+        conversation_id: str,
+        team_id: str | None,
+    ) -> bool:
+        """Assign a session team discovery scope, or clear it with ``None``.
+
+        This updates classification only and does not alter session grants.
+
+        :param conversation_id: The conversation to update.
+        :param team_id: Team scope, or ``None`` to clear it.
+        :returns: ``True`` if the metadata row exists, otherwise ``False``.
+        """
+        del conversation_id, team_id
+        return False
 
     @abstractmethod
     def increment_session_usage(
