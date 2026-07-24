@@ -178,7 +178,22 @@ class CredentialAuditEvent:
 
 
 class CredentialProvider(Protocol):
-    """Addon seam that mints credentials for the active actor."""
+    """Addon seam that mints credentials for the exact active turn.
+
+    ``CredentialBrokerBridge`` calls :meth:`issue` only after authenticating an
+    opaque process capability and rebinding it to an immutable
+    ``(session_id, turn_id, actor)`` snapshot. Implementations must authorize
+    that full context, return the same actor on the grant, and keep credential
+    TTL at or below fifteen minutes. Providers must not infer a mutable actor
+    from session state after awaiting external work.
+
+    Secret values may exist only in ``CredentialGrant.secret`` and must never be
+    logged, included in exceptions, or persisted in session/API records. The
+    bridge injects a valid secret only into the trusted bounded Git/``gh`` child
+    process and redacts it from captured output. Launch-scoped providers own
+    their external lease lifecycle; turn and session capabilities are revoked by
+    the bridge independently.
+    """
 
     async def issue(
         self, context: ActiveCredentialTurn, request: CredentialRequest

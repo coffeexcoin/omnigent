@@ -35,7 +35,8 @@ restart can release credentials created before :meth:`acquire` returned. Only
 the non-secret reference is persisted after acquisition. A failed launch
 releases the live lease object; successful and interrupted leases are released
 through :meth:`ManagedCredentialHook.release` on teardown, relaunch, or restart
-recovery. Both release methods must be idempotent and must never raise.
+recovery. Both release methods must be idempotent; transient failures raise a
+sanitized exception so the durable cleanup record remains retryable.
 """
 
 from __future__ import annotations
@@ -114,7 +115,7 @@ class ManagedCredentialLease(ABC):
     One lease corresponds to ONE managed-host launch generation. It is a
     HANDLE, not a secret container: the addon resolves and delivers the actual
     credential material out of band (today, into whatever store the launcher's
-    provider reads — a future PR wires the Kubernetes Secret path), and hands
+    provider reads (the concrete GitHub hook uses a Kubernetes Secret), and hands
     the server back only a non-secret :attr:`reference` plus lifecycle hooks.
     Keeping secret payloads off this object is what lets the managed-launch
     layer log, repr, and error around leases freely without leaking anything.
@@ -151,10 +152,10 @@ class ManagedCredentialLease(ABC):
         the acquiring process exits is reconstructed through the hook instead.
 
         MUST be idempotent — a second call, or a call on a lease whose
-        credentials were never fully provisioned, is a no-op — and MUST NOT
-        raise: cleanup runs on an error path where the caller has nothing to do
-        with a failure but log it. The default implementation is a no-op, for
-        addons whose credentials need no explicit teardown.
+        credentials were never fully provisioned, is a no-op. Transient failures
+        should raise a sanitized exception so durable cleanup remains retryable.
+        The default implementation is a no-op for credentials needing no
+        explicit teardown.
         """
 
     def __repr__(self) -> str:
@@ -228,6 +229,12 @@ class ManagedCredentialHook(ABC):
         an old generation, and by restart recovery. ``reference`` may be ``None``
         after a crash during :meth:`acquire`; implementations must then derive
         the provider resource from ``context.owner``, ``context.host_id``, and
-        *generation*. Implementations must be idempotent and never raise. The
-        default is a no-op for credentials needing no explicit cleanup.
+        *generation*. Implementations must be idempotent and treat missing
+        provider resources as success. Transient failures should raise a
+        sanitized exception so the orchestrator retains the durable record for
+        retry. The default is a no-op for credentials needing no explicit
+        cleanup.
         """
+
+    async def aclose(self) -> None:  # noqa: B027 - intentional concrete no-op
+        """Close hook-owned clients when the server shuts down."""

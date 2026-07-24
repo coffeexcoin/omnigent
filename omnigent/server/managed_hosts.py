@@ -140,6 +140,10 @@ import click
 from fastapi import HTTPException
 
 from omnigent.db.utils import now_epoch
+from omnigent.server.github_credentials import (
+    BrokeredGitHubCredentialHook,
+    BrokeredGitHubCredentialHookConfig,
+)
 from omnigent.server.managed_credentials import (
     ManagedCredentialHook,
     ManagedCredentialLease,
@@ -511,13 +515,13 @@ class ManagedSandboxConfig:
         ``api_key_ref: env:VAR`` indirection, resolved inside the
         sandbox against its own environment.
     :param credential_hook: Optional per-launch credential resolver an
-        embedding deployment injects to make each managed host act with
-        its owner's credentials (see
-        :mod:`omnigent.server.managed_credentials`). Consulted once per
-        launch, immediately before the in-sandbox host starts; its lease
-        reference is exposed to launcher startup. ``None`` (the default,
-        and the only value the YAML path produces) keeps the original
-        behavior — no credentials are resolved and no lease is acquired.
+        embedding deployment injects, or the Kubernetes YAML path builds from
+        ``sandbox.github_credentials``, to make each managed host act with its
+        owner's credentials (see :mod:`omnigent.server.managed_credentials`).
+        Consulted once per launch, immediately before the in-sandbox host
+        starts; its lease reference is exposed to launcher startup. ``None``
+        keeps the original behavior — no credentials are resolved and no lease
+        is acquired.
     :param credential_acquisition_timeout_s: Maximum seconds to wait for
         ``credential_hook.acquire``. Hooks must honor task cancellation so a
         timed-out producer cannot create credentials after launch cleanup.
@@ -864,6 +868,53 @@ def _parse_host_config(raw: dict[str, object]) -> dict[str, object] | None:
     return host_config
 
 
+def _parse_github_credential_hook(
+    raw: dict[str, object],
+    provider: str,
+) -> tuple[ManagedCredentialHook | None, float]:
+    section = raw.get("github_credentials")
+    if section is None:
+        return None, _CREDENTIAL_ACQUISITION_TIMEOUT_S
+    if provider != "kubernetes":
+        raise ValueError(
+            "server config 'sandbox.github_credentials' is currently only supported "
+            "with sandbox.provider 'kubernetes'"
+        )
+    if not isinstance(section, dict):
+        raise ValueError("server config 'sandbox.github_credentials' must be a mapping")
+    allowed = {"endpoint", "max_lease_ttl_s", "acquisition_timeout_s"}
+    unknown = sorted(set(section) - allowed)
+    if unknown:
+        raise ValueError(
+            "server config 'sandbox.github_credentials' has unknown key(s): " + ", ".join(unknown)
+        )
+    endpoint = section.get("endpoint")
+    if not isinstance(endpoint, str) or not endpoint.strip():
+        raise ValueError(
+            "server config 'sandbox.github_credentials.endpoint' must be a non-empty URL"
+        )
+    max_ttl = section.get("max_lease_ttl_s", 24 * 60 * 60)
+    acquisition_timeout = section.get(
+        "acquisition_timeout_s",
+        _CREDENTIAL_ACQUISITION_TIMEOUT_S,
+    )
+    for value, path in (
+        (max_ttl, "max_lease_ttl_s"),
+        (acquisition_timeout, "acquisition_timeout_s"),
+    ):
+        if isinstance(value, bool) or not isinstance(value, (int, float)) or value <= 0:
+            raise ValueError(
+                f"server config 'sandbox.github_credentials.{path}' must be a positive number"
+            )
+    hook = BrokeredGitHubCredentialHook(
+        BrokeredGitHubCredentialHookConfig(
+            endpoint=endpoint,
+            max_lease_ttl_s=float(max_ttl),
+        )
+    )
+    return hook, float(acquisition_timeout)
+
+
 def parse_sandbox_config(raw: object) -> ManagedSandboxConfig | None:
     """
     Parse and validate the server config's ``sandbox:`` section.
@@ -898,6 +949,10 @@ def parse_sandbox_config(raw: object) -> ManagedSandboxConfig | None:
     # Validated regardless of provider (like server_url): a malformed
     # host_config should stop startup even for staged/unsupported providers.
     host_config = _parse_host_config(raw)
+    credential_hook, credential_acquisition_timeout_s = _parse_github_credential_hook(
+        raw,
+        provider,
+    )
     if provider == "modal":
         launcher_factory = _modal_launcher_factory(
             _parse_modal_image(raw), _parse_modal_secrets(raw)
@@ -987,6 +1042,8 @@ def parse_sandbox_config(raw: object) -> ManagedSandboxConfig | None:
         managed_launch_supported=provider in PROVIDERS_WITH_MANAGED_LAUNCH,
         provider=provider,
         host_config=host_config,
+        credential_hook=credential_hook,
+        credential_acquisition_timeout_s=credential_acquisition_timeout_s,
     )
 
 

@@ -18,7 +18,7 @@ import threading
 import time
 from collections.abc import AsyncIterator, Callable, Generator
 from pathlib import Path
-from typing import TYPE_CHECKING, cast
+from typing import TYPE_CHECKING, Protocol, cast
 
 import httpx
 from fastapi import FastAPI
@@ -979,6 +979,61 @@ async def _resolve_agent_spec_from_server(
     return ResolvedSpec(spec=spec, workdir=dest)
 
 
+class _AsyncCloseable(Protocol):
+    """Resource with asynchronous ``close`` cleanup."""
+
+    async def close(self) -> None: ...
+
+
+class _AsyncAcloseable(Protocol):
+    """Resource with asynchronous ``aclose`` cleanup."""
+
+    async def aclose(self) -> None: ...
+
+
+class _AsyncShutdownable(Protocol):
+    """Resource with asynchronous ``shutdown`` cleanup."""
+
+    async def shutdown(self) -> None: ...
+
+
+async def _shutdown_runner_resources(
+    *,
+    credential_bridge: _AsyncCloseable | None,
+    credential_provider: _AsyncAcloseable | None,
+    pane_reaper: _AsyncShutdownable | None,
+    process_manager: _AsyncShutdownable,
+    terminal_registry: _AsyncShutdownable,
+    mcp_manager: _AsyncShutdownable | None,
+    server_client: _AsyncAcloseable,
+) -> None:
+    """Attempt every runner cleanup step and re-raise the first failure."""
+
+    steps = (
+        ("credential bridge", credential_bridge, "close"),
+        ("credential provider", credential_provider, "aclose"),
+        ("native pane reaper", pane_reaper, "shutdown"),
+        ("process manager", process_manager, "shutdown"),
+        ("terminal registry", terminal_registry, "shutdown"),
+        ("MCP manager", mcp_manager, "shutdown"),
+        ("server client", server_client, "aclose"),
+    )
+    first_error: BaseException | None = None
+    for label, resource, method_name in steps:
+        if resource is None:
+            continue
+        try:
+            await getattr(resource, method_name)()
+        except BaseException as exc:  # noqa: BLE001 - finish independent cleanup first
+            if first_error is None:
+                first_error = exc
+            # Credential cleanup may cross an external trust boundary. Never
+            # attach exception text that could contain credential material.
+            _logger.warning("Runner shutdown step failed: %s", label)
+    if first_error is not None:
+        raise first_error
+
+
 def create_app(
     auth_token_factory: Callable[[], str | None] | None = None,
     mcp_credential_resolver: McpCredentialResolver | None = None,
@@ -1021,6 +1076,14 @@ def create_app(
     # Keep the harness manager on its default /tmp/omnigent root.
     # Nesting harness UDS paths under caller-provided temp dirs can
     # exceed AF_UNIX path limits on macOS.
+    from omnigent.runner.github_credentials import (
+        consume_github_credential_provider_from_environment,
+    )
+
+    # The managed launch hook projects an opaque GitHub broker capability into
+    # this process. Consume and scrub it before constructing any process manager
+    # so agent children can inherit neither that capability nor ambient PATs.
+    github_credential_provider = consume_github_credential_provider_from_environment()
     pm = HarnessProcessManager()
 
     # MCP pool — the runner owns stdio MCP subprocess spawning.
@@ -1140,6 +1203,7 @@ def create_app(
         mcp_manager=mcp_manager,
         auth_token=runner_auth_token,
         auth_token_factory=auth_token_factory,
+        credential_provider=github_credential_provider,
     )
 
     async def _start_pm() -> None:
@@ -1173,26 +1237,31 @@ def create_app(
 
         :returns: None.
         """
+        credential_bridge = getattr(app.state, "credential_broker", None)
         _pane_reaper = getattr(app.state, "native_pane_reaper", None)
-        if _pane_reaper is not None:
-            await _pane_reaper.shutdown()
-        await pm.shutdown()
-        await _terminal_registry.shutdown()
-        if mcp_manager is not None:
-            await mcp_manager.shutdown()
-        await server_client.aclose()
-        # Best-effort cleanup of extracted spec bundles. Missing
-        # / already-gone is fine; ignore_errors handles a partial
-        # write that leaves a directory in an unreadable state.
-        import shutil
+        try:
+            await _shutdown_runner_resources(
+                credential_bridge=credential_bridge,
+                credential_provider=github_credential_provider,
+                pane_reaper=_pane_reaper,
+                process_manager=pm,
+                terminal_registry=_terminal_registry,
+                mcp_manager=mcp_manager,
+                server_client=server_client,
+            )
+        finally:
+            # Best-effort cleanup of extracted spec bundles. Missing
+            # / already-gone is fine; ignore_errors handles a partial
+            # write that leaves a directory in an unreadable state.
+            import shutil
 
-        shutil.rmtree(_spec_cache_root, ignore_errors=True)
+            shutil.rmtree(_spec_cache_root, ignore_errors=True)
 
     # starlette 1.x removed add_event_handler; drive startup/shutdown via lifespan.
     @contextlib.asynccontextmanager
     async def _lifespan(_app: FastAPI) -> AsyncIterator[None]:
-        await _start_pm()
         try:
+            await _start_pm()
             yield
         finally:
             await _stop_pm()
