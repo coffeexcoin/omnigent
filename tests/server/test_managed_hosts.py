@@ -2263,11 +2263,69 @@ class _FakeCredentialHook(ManagedCredentialHook):
         self.release_calls.append((context, generation, reference))
 
 
-class _FakeProviderCredentialHook(ManagedCredentialHook):
-    """Model deterministic provider resources such as Kubernetes Secrets."""
+@dataclasses.dataclass(frozen=True, repr=False)
+class _FakeKubernetesSecret:
+    """Secret-like provider resource whose value is always redacted."""
 
-    def __init__(self, resources: set[str], *, fail_after_create: bool = False) -> None:
-        self.resources = resources
+    name: str
+    host_id: str
+    generation: int
+    _data: dict[str, str] = dataclasses.field(compare=False)
+
+    def __repr__(self) -> str:
+        return f"_FakeKubernetesSecret(name={self.name!r})"
+
+
+class _FakeKubernetesCredentialProvider:
+    """Track provider-side Secrets independently from the durable SQL ledger."""
+
+    _SECRET_VALUE = "fake-provider-secret-value"
+
+    def __init__(self) -> None:
+        self._secrets: dict[str, _FakeKubernetesSecret] = {}
+
+    @staticmethod
+    def resource_name(
+        context: ManagedLaunchContext | ManagedCredentialReleaseContext,
+        generation: int,
+    ) -> str:
+        return f"managed-cred-{context.host_id[:8]}-{generation}"
+
+    @property
+    def names(self) -> set[str]:
+        return set(self._secrets)
+
+    def create(
+        self,
+        context: ManagedLaunchContext | ManagedCredentialReleaseContext,
+        generation: int,
+    ) -> str:
+        name = self.resource_name(context, generation)
+        self._secrets[name] = _FakeKubernetesSecret(
+            name=name,
+            host_id=context.host_id,
+            generation=generation,
+            _data={"token": self._SECRET_VALUE},
+        )
+        return name
+
+    def delete(self, name: str) -> None:
+        self._secrets.pop(name, None)
+
+    def __repr__(self) -> str:
+        return f"_FakeKubernetesCredentialProvider(names={sorted(self._secrets)!r})"
+
+
+class _FakeProviderCredentialHook(ManagedCredentialHook):
+    """Materialize deterministic Kubernetes-like Secrets for acceptance tests."""
+
+    def __init__(
+        self,
+        provider: _FakeKubernetesCredentialProvider,
+        *,
+        fail_after_create: bool = False,
+    ) -> None:
+        self.provider = provider
         self.fail_after_create = fail_after_create
         self.release_calls: list[tuple[ManagedCredentialReleaseContext, int, str | None]] = []
 
@@ -2277,7 +2335,7 @@ class _FakeProviderCredentialHook(ManagedCredentialHook):
         generation: int,
     ) -> str:
         """Return the deterministic provider resource name for a generation."""
-        return f"managed-cred-{context.host_id[:8]}-{generation}"
+        return _FakeKubernetesCredentialProvider.resource_name(context, generation)
 
     async def acquire(
         self,
@@ -2285,8 +2343,7 @@ class _FakeProviderCredentialHook(ManagedCredentialHook):
         generation: int,
     ) -> ManagedCredentialLease:
         """Create a provider resource, optionally crashing before returning it."""
-        reference = self.resource_name(context, generation)
-        self.resources.add(reference)
+        reference = self.provider.create(context, generation)
         if self.fail_after_create:
             raise RuntimeError("credential provider failed after creating resource")
         return _FakeCredentialLease(reference=reference)
@@ -2299,7 +2356,7 @@ class _FakeProviderCredentialHook(ManagedCredentialHook):
     ) -> None:
         """Delete by reference or reconstruct the name for an interrupted acquire."""
         self.release_calls.append((context, generation, reference))
-        self.resources.discard(reference or self.resource_name(context, generation))
+        self.provider.delete(reference or self.resource_name(context, generation))
 
 
 class _CredentialRefRecordingLauncher(FakeSandboxLauncher):
@@ -2558,6 +2615,45 @@ async def test_launch_exposes_lease_reference_to_start_host(db_uri: str) -> None
     assert lease.release_calls == 0
 
 
+async def test_provider_secret_and_durable_lease_share_one_lifecycle(db_uri: str) -> None:
+    """A launched sandbox has one provider Secret and termination leaves no orphan."""
+    launch_store = HostStore(db_uri)
+    launcher = _CredentialRefRecordingLauncher(on_host_start=_online_register(launch_store))
+    provider = _FakeKubernetesCredentialProvider()
+    launch_hook = _FakeProviderCredentialHook(provider)
+
+    result = await launch_managed_host(
+        config=_hook_config(launcher, launch_hook),
+        owner=_OWNER,
+        host_store=launch_store,
+        session_id="conv_acceptance",
+    )
+
+    active = launch_store.list_credential_leases(result.host_id)
+    assert len(active) == 1
+    assert active[0].state == "active"
+    assert active[0].sandbox_id == "sb-fake-1"
+    assert active[0].reference is not None
+    assert provider.names == {active[0].reference}
+    assert launcher.credential_references == [active[0].reference]
+    assert provider._SECRET_VALUE not in repr(provider)
+
+    restarted_store = HostStore(db_uri)
+    host = restarted_store.get_host(result.host_id)
+    assert host is not None
+    restarted_hook = _FakeProviderCredentialHook(provider)
+    await terminate_managed_host(
+        host,
+        restarted_store,
+        _hook_config(launcher, restarted_hook),
+    )
+
+    assert provider.names == set()
+    assert restarted_store.list_credential_leases(result.host_id) == []
+    assert restarted_store.get_host(result.host_id) is None
+    assert len(restarted_hook.release_calls) == 1
+
+
 async def test_terminate_releases_successful_lease_after_process_restart(db_uri: str) -> None:
     """Teardown reconstructs cleanup from storage, not the launch's in-memory lease."""
     launch_store = HostStore(db_uri)
@@ -2609,7 +2705,7 @@ async def test_failed_teardown_release_remains_recoverable_after_host_deletion(
 
     secret = "provider-error-secret-value"
 
-    class _FailingReleaseHook(_FakeCredentialHook):
+    class _FailingReleaseHook(_FakeProviderCredentialHook):
         async def release(
             self,
             context: ManagedCredentialReleaseContext,
@@ -2620,8 +2716,9 @@ async def test_failed_teardown_release_remains_recoverable_after_host_deletion(
 
     launch_store = HostStore(db_uri)
     launcher = FakeSandboxLauncher(on_host_start=_online_register(launch_store))
+    provider = _FakeKubernetesCredentialProvider()
     result = await launch_managed_host(
-        config=_hook_config(launcher, _FakeCredentialHook()),
+        config=_hook_config(launcher, _FakeProviderCredentialHook(provider)),
         owner=_OWNER,
         host_store=launch_store,
     )
@@ -2631,7 +2728,7 @@ async def test_failed_teardown_release_remains_recoverable_after_host_deletion(
     await terminate_managed_host(
         host,
         launch_store,
-        _hook_config(launcher, _FailingReleaseHook()),
+        _hook_config(launcher, _FailingReleaseHook(provider)),
     )
 
     assert launch_store.get_host(result.host_id) is None
@@ -2642,6 +2739,7 @@ async def test_failed_teardown_release_remains_recoverable_after_host_deletion(
     assert retryable[0].claim_expires_at is not None
     assert secret not in repr(retryable[0])
     assert secret not in caplog.text
+    assert len(provider.names) == 1
 
     engine = sa.create_engine(db_uri)
     try:
@@ -2652,12 +2750,13 @@ async def test_failed_teardown_release_remains_recoverable_after_host_deletion(
     finally:
         engine.dispose()
 
-    recovery_hook = _FakeCredentialHook()
+    recovery_hook = _FakeProviderCredentialHook(provider)
     await recover_managed_credential_leases(
         _hook_config(FakeSandboxLauncher(), recovery_hook),
         HostStore(db_uri),
     )
     assert launch_store.list_credential_leases(result.host_id) == []
+    assert provider.names == set()
     assert len(recovery_hook.release_calls) == 1
 
 
@@ -2699,10 +2798,11 @@ async def test_restart_recovery_sweeps_pending_credential_lease(db_uri: str) -> 
         host_name="managed-recovery",
         session_id="conv_crashed",
     )
-    provider_resources = {_FakeProviderCredentialHook.resource_name(context, pending.generation)}
+    provider = _FakeKubernetesCredentialProvider()
+    provider.create(context, pending.generation)
 
     restarted_store = HostStore(db_uri)
-    restarted_hook = _FakeProviderCredentialHook(provider_resources)
+    restarted_hook = _FakeProviderCredentialHook(provider)
     restarted_launcher = FakeSandboxLauncher()
     await recover_managed_credential_leases(
         _hook_config(restarted_launcher, restarted_hook),
@@ -2712,7 +2812,7 @@ async def test_restart_recovery_sweeps_pending_credential_lease(db_uri: str) -> 
     assert restarted_launcher.terminated == ["sb-orphaned"]
     assert restarted_store.get_host(host_id) is None
     assert restarted_store.list_credential_leases() == []
-    assert provider_resources == set()
+    assert provider.names == set()
     assert len(restarted_hook.release_calls) == 1
     assert restarted_hook.release_calls[0][1:] == (1, None)
 
@@ -2763,8 +2863,9 @@ async def test_real_app_lifespan_recovers_crashed_launch(
     finally:
         engine.dispose()
 
-    provider_resources = {_FakeProviderCredentialHook.resource_name(context, pending.generation)}
-    hook = _FakeProviderCredentialHook(provider_resources)
+    provider = _FakeKubernetesCredentialProvider()
+    provider.create(context, pending.generation)
+    hook = _FakeProviderCredentialHook(provider)
     launcher = FakeSandboxLauncher()
     app = _capability_probe_app(db_uri, tmp_path, _hook_config(launcher, hook))
     monkeypatch.setattr(_globals, "_terminal_registry", TerminalRegistry())
@@ -2772,12 +2873,12 @@ async def test_real_app_lifespan_recovers_crashed_launch(
     async with app.router.lifespan_context(app):
         for _ in range(100):
             leases = await asyncio.to_thread(crashed_store.list_credential_leases, host_id)
-            if not provider_resources and not leases:
+            if not provider.names and not leases:
                 break
             await asyncio.sleep(0.01)
 
     restarted_store = HostStore(db_uri)
-    assert provider_resources == set()
+    assert provider.names == set()
     assert launcher.terminated == ["sb-lifespan-orphan"]
     assert restarted_store.get_host(host_id) is None
     assert restarted_store.list_credential_leases() == []
@@ -2795,8 +2896,8 @@ async def test_lifespan_stays_available_when_credential_release_blocks(
     """Startup and shutdown stay bounded while recovery remains durably retryable."""
 
     class _BlockingReleaseHook(_FakeProviderCredentialHook):
-        def __init__(self, resources: set[str]) -> None:
-            super().__init__(resources)
+        def __init__(self, provider: _FakeKubernetesCredentialProvider) -> None:
+            super().__init__(provider)
             self.entered = asyncio.Event()
             self.release_gate = asyncio.Event()
 
@@ -2848,8 +2949,9 @@ async def test_lifespan_stays_available_when_credential_release_blocks(
                 )
             )
 
-        resources = {_FakeProviderCredentialHook.resource_name(context, pending.generation)}
-        hook = _BlockingReleaseHook(resources)
+        provider = _FakeKubernetesCredentialProvider()
+        provider.create(context, pending.generation)
+        hook = _BlockingReleaseHook(provider)
         launcher = FakeSandboxLauncher()
         config = _hook_config(launcher, hook)
         app = _capability_probe_app(db_uri, tmp_path, config)
@@ -2858,7 +2960,7 @@ async def test_lifespan_stays_available_when_credential_release_blocks(
         async def probe_startup() -> None:
             async with app.router.lifespan_context(app):
                 await asyncio.wait_for(hook.entered.wait(), timeout=0.5)
-                assert resources
+                assert provider.names
                 async with AsyncClient(
                     transport=ASGITransport(app=app),
                     base_url="http://test",
@@ -2886,7 +2988,7 @@ async def test_lifespan_stays_available_when_credential_release_blocks(
         )
 
         assert retry_launcher.terminated == ["sb-blocked-recovery"]
-        assert resources == set()
+        assert provider.names == set()
         assert len(hook.release_calls) == 1
         assert store.list_credential_leases(host_id) == []
     finally:
@@ -2957,8 +3059,9 @@ async def test_recovery_claim_is_single_owner_across_replicas(db_uri: str) -> No
     finally:
         engine.dispose()
 
-    resources = {_FakeProviderCredentialHook.resource_name(context, pending.generation)}
-    hooks = [_FakeProviderCredentialHook(resources), _FakeProviderCredentialHook(resources)]
+    provider = _FakeKubernetesCredentialProvider()
+    provider.create(context, pending.generation)
+    hooks = [_FakeProviderCredentialHook(provider), _FakeProviderCredentialHook(provider)]
     launchers = [FakeSandboxLauncher(), FakeSandboxLauncher()]
     await asyncio.gather(
         *(
@@ -2970,7 +3073,7 @@ async def test_recovery_claim_is_single_owner_across_replicas(db_uri: str) -> No
         )
     )
 
-    assert resources == set()
+    assert provider.names == set()
     assert sum(len(hook.release_calls) for hook in hooks) == 1
     assert sum(len(launcher.terminated) for launcher in launchers) == 1
     assert store.list_credential_leases() == []
@@ -3651,8 +3754,8 @@ async def test_hook_failure_after_provider_create_leaves_zero_orphans(db_uri: st
     """Durable cleanup closes the provider-create-before-reference crash window."""
     host_store = HostStore(db_uri)
     fake = FakeSandboxLauncher(on_host_start=_online_register(host_store))
-    provider_resources: set[str] = set()
-    hook = _FakeProviderCredentialHook(provider_resources, fail_after_create=True)
+    provider = _FakeKubernetesCredentialProvider()
+    hook = _FakeProviderCredentialHook(provider, fail_after_create=True)
 
     with pytest.raises(HTTPException) as exc:
         await launch_managed_host(
@@ -3662,7 +3765,7 @@ async def test_hook_failure_after_provider_create_leaves_zero_orphans(db_uri: st
         )
 
     assert exc.value.status_code == 502
-    assert provider_resources == set()
+    assert provider.names == set()
     assert fake.terminated == ["sb-fake-1"]
     assert host_store.list_credential_leases() == []
     assert len(hook.release_calls) == 1
