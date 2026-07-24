@@ -158,8 +158,8 @@ class ManagedCredentialLease(ABC):
         """
 
     def __repr__(self) -> str:
-        """Redacted repr: class name + non-secret reference only."""
-        return f"{type(self).__name__}(reference={self.reference!r})"
+        """Return a representation that never resolves or exposes provider state."""
+        return f"{type(self).__name__}(reference=[REDACTED], secret=[REDACTED])"
 
 
 class ManagedCredentialHook(ABC):
@@ -184,8 +184,7 @@ class ManagedCredentialHook(ABC):
         context: ManagedLaunchContext,
         generation: int,
     ) -> ManagedCredentialLease:
-        """
-        Resolve credentials for *context* and return a lease.
+        """Resolve credentials for one launch and return their lease.
 
         Called exactly once per managed-host launch attempt, after *generation*
         is durably reserved and before the host process starts. Implementations
@@ -195,6 +194,11 @@ class ManagedCredentialHook(ABC):
         :meth:`release` clean up even if the process dies while this method is
         creating a scoped token or provider Secret, before a reference can be
         persisted.
+
+        Implementations must honor task cancellation. The server enforces its
+        deadline without waiting for a cancellation-resistant implementation,
+        runs deterministic release from the durable launch identity, and also
+        releases any lease the late task eventually returns.
 
         Raising aborts the launch: the orchestration treats a failed acquire
         like any other post-provision failure — it tears the sandbox down and
@@ -210,6 +214,7 @@ class ManagedCredentialHook(ABC):
         :raises Exception: When credentials cannot be resolved; the launch is
             aborted and the sandbox torn down.
         """
+        ...
 
     async def release(  # noqa: B027 — intentional concrete no-op
         self,

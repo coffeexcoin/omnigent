@@ -10,11 +10,18 @@ import sqlalchemy as sa
 
 from omnigent.db.db_models import SqlManagedCredentialLease
 from omnigent.db.utils import get_or_create_engine, now_epoch
-from omnigent.stores.host_store import CredentialLeaseRecord, HostStore
+from omnigent.stores.host_store import CredentialLeaseRecord, HostStore, _rowcount
 
 _HOST_ID = "112233445566478890abcdef12345678"
 _USER_ID = "alice@example.com"
 _HOST_NAME = "managed-foundation"
+
+
+@pytest.mark.parametrize("value", [None, -1, "1"])
+def test_unknown_dml_rowcounts_fail_closed(value: object) -> None:
+    """Dialect-specific unknown rowcounts never crash or claim CAS success."""
+    result = type("Result", (), {"rowcount": value})()
+    assert _rowcount(result) == 0
 
 
 def _record(
@@ -260,6 +267,9 @@ def test_non_future_claim_expiries_do_not_authorize_cleanup(db_uri: str) -> None
         )
         is None
     )
+    assert store.set_credential_lease_reference(
+        _HOST_ID, active.generation, "secret-ref", "launch-owner-1"
+    )
     store.upsert_on_connect(_HOST_ID, _HOST_NAME, _USER_ID)
     assert store.activate_credential_lease(
         _HOST_ID,
@@ -338,6 +348,9 @@ def test_active_claim_is_fenced_to_expected_sandbox_generation(db_uri: str) -> N
     store = HostStore(db_uri)
     _register(store, "sb-generation-1")
     first = _record(store)
+    assert store.set_credential_lease_reference(
+        _HOST_ID, first.generation, "secret-ref-1", "launch-owner-1"
+    )
     store.upsert_on_connect(_HOST_ID, _HOST_NAME, _USER_ID)
     assert store.activate_credential_lease(
         _HOST_ID,
@@ -351,6 +364,9 @@ def test_active_claim_is_fenced_to_expected_sandbox_generation(db_uri: str) -> N
         store,
         sandbox_id="sb-generation-2",
         owner_token="launch-owner-2",
+    )
+    assert store.set_credential_lease_reference(
+        _HOST_ID, second.generation, "secret-ref-2", "launch-owner-2"
     )
     store.upsert_on_connect(_HOST_ID, _HOST_NAME, _USER_ID)
     assert store.activate_credential_lease(
@@ -382,6 +398,9 @@ def test_cleanup_claim_takes_over_expired_retiring_generation(db_uri: str) -> No
     store = HostStore(db_uri)
     _register(store, "sb-generation-1")
     record = _record(store)
+    assert store.set_credential_lease_reference(
+        _HOST_ID, record.generation, "secret-ref", "launch-owner-1"
+    )
     store.upsert_on_connect(_HOST_ID, _HOST_NAME, _USER_ID)
     assert store.activate_credential_lease(
         _HOST_ID,
@@ -422,12 +441,7 @@ def test_reference_activation_and_release_are_cas_fenced(db_uri: str) -> None:
         claim_owner="cleanup-1",
     )
 
-    assert not store.set_credential_lease_reference(
-        _HOST_ID, record.generation, "secret-ref", "wrong-owner"
-    )
-    assert store.set_credential_lease_reference(
-        _HOST_ID, record.generation, "secret-ref", "launch-owner-1"
-    )
+    store.upsert_on_connect(_HOST_ID, _HOST_NAME, _USER_ID)
     assert not store.activate_credential_lease(
         _HOST_ID,
         record.generation,
@@ -435,7 +449,12 @@ def test_reference_activation_and_release_are_cas_fenced(db_uri: str) -> None:
         expected_sandbox_id="sb-generation-1",
     )
 
-    store.upsert_on_connect(_HOST_ID, _HOST_NAME, _USER_ID)
+    assert not store.set_credential_lease_reference(
+        _HOST_ID, record.generation, "secret-ref", "wrong-owner"
+    )
+    assert store.set_credential_lease_reference(
+        _HOST_ID, record.generation, "secret-ref", "launch-owner-1"
+    )
     assert not store.activate_credential_lease(
         _HOST_ID,
         record.generation,
@@ -516,11 +535,61 @@ def test_reference_activation_and_release_are_cas_fenced(db_uri: str) -> None:
     assert tombstone[0].reference is None
 
 
+def test_completed_provider_cleanup_survives_final_cas_retry(db_uri: str) -> None:
+    """A failed tombstone CAS does not make recovery repeat provider cleanup."""
+    store = HostStore(db_uri)
+    _register(store, "sb-generation-1")
+    record = _record(store)
+    assert store.set_credential_lease_reference(
+        _HOST_ID, record.generation, "secret-ref", "launch-owner-1"
+    )
+    store.upsert_on_connect(_HOST_ID, _HOST_NAME, _USER_ID)
+    assert store.activate_credential_lease(
+        _HOST_ID,
+        record.generation,
+        "launch-owner-1",
+        expected_sandbox_id="sb-generation-1",
+    )
+    claimed = store.claim_active_credential_leases(
+        _HOST_ID,
+        claim_owner="cleanup-1",
+        claim_expires_at=now_epoch() + 120,
+    )
+    assert [row.generation for row in claimed] == [record.generation]
+
+    assert store.complete_credential_lease_cleanup(
+        _HOST_ID,
+        record.generation,
+        claim_owner="cleanup-1",
+    )
+    persisted = store.list_credential_leases(_HOST_ID)[0]
+    assert persisted.state == "retiring"
+    assert persisted.credential_cleanup_required is False
+    assert persisted.reference is None
+
+    _expire_claim(db_uri, record.generation)
+    replacement = store.claim_recoverable_credential_leases(
+        claim_owner="cleanup-2",
+        stale_before=now_epoch(),
+        claim_expires_at=now_epoch() + 120,
+    )
+    assert len(replacement) == 1
+    assert replacement[0].credential_cleanup_required is False
+    assert store.release_credential_lease(
+        _HOST_ID,
+        record.generation,
+        claim_owner="cleanup-2",
+    )
+
+
 def test_recovery_preserves_only_exact_active_sandbox_binding(db_uri: str) -> None:
     """An active lease is live only while the host points to its sandbox."""
     store = HostStore(db_uri)
     _register(store, "sb-generation-1")
     record = _record(store)
+    assert store.set_credential_lease_reference(
+        _HOST_ID, record.generation, "secret-ref", "launch-owner-1"
+    )
     store.upsert_on_connect(_HOST_ID, _HOST_NAME, _USER_ID)
     assert store.activate_credential_lease(
         _HOST_ID,
@@ -546,6 +615,60 @@ def test_recovery_preserves_only_exact_active_sandbox_binding(db_uri: str) -> No
 
     claims = store.claim_recoverable_credential_leases(
         claim_owner="recovery-2",
+        stale_before=now_epoch(),
+        claim_expires_at=now_epoch() + 120,
+    )
+    assert [row.generation for row in claims] == [record.generation]
+
+
+def test_provider_change_with_reused_sandbox_id_does_not_preserve_old_lease(
+    db_uri: str,
+) -> None:
+    """A provider is part of the durable sandbox binding, not just its id."""
+    store = HostStore(db_uri)
+    _register(store, "sb-generation-1")
+    record = _record(store)
+    assert store.set_credential_lease_reference(
+        _HOST_ID, record.generation, "secret-ref", "launch-owner-1"
+    )
+    store.upsert_on_connect(_HOST_ID, _HOST_NAME, _USER_ID)
+    assert store.activate_credential_lease(
+        _HOST_ID,
+        record.generation,
+        "launch-owner-1",
+        expected_sandbox_id="sb-generation-1",
+    )
+
+    store.register_managed_host(
+        host_id=_HOST_ID,
+        name=_HOST_NAME,
+        user_id=_USER_ID,
+        token="replacement-token",
+        provider="modal",
+        sandbox_id="sb-generation-1",
+        token_expires_at=now_epoch() + 3600,
+        expected_sandbox_id="sb-generation-1",
+    )
+    pending = _record(store, owner_token="launch-owner-2")
+    assert not store.activate_credential_lease(
+        _HOST_ID,
+        pending.generation,
+        "launch-owner-2",
+        expected_sandbox_id="sb-generation-1",
+    )
+
+    assert (
+        store.claim_active_credential_leases(
+            _HOST_ID,
+            claim_owner="modal-cleanup",
+            claim_expires_at=now_epoch() + 120,
+            expected_sandbox_id="sb-generation-1",
+            expected_provider="modal",
+        )
+        == []
+    )
+    claims = store.claim_recoverable_credential_leases(
+        claim_owner="kubernetes-recovery",
         stale_before=now_epoch(),
         claim_expires_at=now_epoch() + 120,
     )

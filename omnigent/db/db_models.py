@@ -1322,7 +1322,7 @@ class SqlManagedCredentialLease(OmnigentBase):
     repo_url: Mapped[str | None] = mapped_column(String(2048), nullable=True)
     repo_branch: Mapped[str | None] = mapped_column(String(256), nullable=True)
     repo_name: Mapped[str | None] = mapped_column(String(256), nullable=True)
-    reference: Mapped[str | None] = mapped_column(String(256), nullable=True)
+    reference: Mapped[str | None] = mapped_column(Text, nullable=True)
     credential_cleanup_required: Mapped[bool] = mapped_column(
         Boolean,
         nullable=False,

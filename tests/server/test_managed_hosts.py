@@ -5,10 +5,12 @@ from __future__ import annotations
 import asyncio
 import dataclasses
 import datetime
+import subprocess
+import sys
 import threading
 from collections.abc import Callable
 from pathlib import Path
-from typing import ClassVar
+from typing import Any, ClassVar
 
 import click
 import pytest
@@ -2215,6 +2217,27 @@ class _FakeCredentialLease(ManagedCredentialLease):
         self.release_calls += 1
 
 
+class _ChangingReferenceLease(_FakeCredentialLease):
+    """Return a different handle on every read to prove launch snapshots once."""
+
+    def __init__(self) -> None:
+        super().__init__(reference=None)
+        self.reference_reads = 0
+
+    @property
+    def reference(self) -> str:
+        self.reference_reads += 1
+        return f"managed-cred-{self.reference_reads}"
+
+
+class _FailingReferenceLease(_FakeCredentialLease):
+    """Raise credential-bearing provider text when the reference is resolved."""
+
+    @property
+    def reference(self) -> str:
+        raise RuntimeError("reference lookup exposed TOP-SECRET-VALUE")
+
+
 class _FakeCredentialHook(ManagedCredentialHook):
     """
     Recording :class:`ManagedCredentialHook` for the seam tests.
@@ -2410,6 +2433,8 @@ class _CredentialRefRecordingLauncher(FakeSandboxLauncher):
 def _hook_config(
     fake: FakeSandboxLauncher,
     hook: ManagedCredentialHook | None,
+    *,
+    acquisition_timeout_s: float = 120.0,
 ) -> ManagedSandboxConfig:
     """
     Build an injected config that also wires *hook* onto ``credential_hook``.
@@ -2424,6 +2449,7 @@ def _hook_config(
         launcher_factory=lambda: fake,
         token_ttl_s=3600,
         credential_hook=hook,
+        credential_acquisition_timeout_s=acquisition_timeout_s,
     )
 
 
@@ -2450,17 +2476,16 @@ def test_launch_context_is_immutable() -> None:
         context.owner = "mallory@example.com"  # type: ignore[misc]
 
 
-def test_credential_lease_repr_redacts_secret() -> None:
+async def test_credential_lease_repr_redacts_secret() -> None:
     """
-    The base lease repr reflects only the class name + non-secret reference —
-    a subclass that stashes raw credential material still reprs safely, so the
-    managed-launch layer can log leases on error paths without leaking.
+    The base lease repr resolves no provider properties and exposes no handles;
+    a subclass that stashes raw credential material still reprs safely.
     """
     lease = _FakeCredentialLease(reference="k8s-secret-xyz", secret="TOP-SECRET-VALUE")
     rendered = repr(lease)
     assert "TOP-SECRET-VALUE" not in rendered
-    assert "k8s-secret-xyz" in rendered
-    assert rendered == "_FakeCredentialLease(reference='k8s-secret-xyz')"
+    assert "k8s-secret-xyz" not in rendered
+    assert rendered == "_FakeCredentialLease(reference=[REDACTED], secret=[REDACTED])"
 
 
 async def test_default_lease_release_is_noop() -> None:
@@ -2615,6 +2640,61 @@ async def test_launch_exposes_lease_reference_to_start_host(db_uri: str) -> None
     assert lease.release_calls == 0
 
 
+async def test_launch_snapshots_credential_reference_once(db_uri: str) -> None:
+    """A stateful reference property cannot diverge between SQL and launcher state."""
+    host_store = HostStore(db_uri)
+    fake = _CredentialRefRecordingLauncher(on_host_start=_online_register(host_store))
+    lease = _ChangingReferenceLease()
+
+    await launch_managed_host(
+        config=_hook_config(fake, _FakeCredentialHook(lease)),
+        owner=_OWNER,
+        host_store=host_store,
+    )
+
+    assert lease.reference_reads == 1
+    assert fake.credential_references == ["managed-cred-1"]
+    assert host_store.list_credential_leases()[0].reference == "managed-cred-1"
+
+
+async def test_reference_resolution_failure_is_redacted_and_recoverable(
+    db_uri: str,
+) -> None:
+    """A raising reference property uses ordinary launch teardown without leaking text."""
+    host_store = HostStore(db_uri)
+    fake = FakeSandboxLauncher()
+    lease = _FailingReferenceLease()
+
+    with pytest.raises(HTTPException) as exc_info:
+        await launch_managed_host(
+            config=_hook_config(fake, _FakeCredentialHook(lease)),
+            owner=_OWNER,
+            host_store=host_store,
+        )
+
+    assert exc_info.value.status_code == 502
+    assert "TOP-SECRET-VALUE" not in str(exc_info.value.detail)
+    assert lease.release_calls == 1
+    assert fake.terminated == ["sb-fake-1"]
+    assert host_store.list_credential_leases() == []
+
+
+async def test_long_credential_reference_round_trips(db_uri: str) -> None:
+    """Provider handles are arbitrary non-secret text, not a 256-byte protocol field."""
+    host_store = HostStore(db_uri)
+    fake = _CredentialRefRecordingLauncher(on_host_start=_online_register(host_store))
+    reference = "provider-resource/" + ("x" * 512)
+
+    await launch_managed_host(
+        config=_hook_config(fake, _FakeCredentialHook(_FakeCredentialLease(reference))),
+        owner=_OWNER,
+        host_store=host_store,
+    )
+
+    assert fake.credential_references == [reference]
+    assert host_store.list_credential_leases()[0].reference == reference
+
+
 async def test_provider_secret_and_durable_lease_share_one_lifecycle(db_uri: str) -> None:
     """A launched sandbox has one provider Secret and termination leaves no orphan."""
     launch_store = HostStore(db_uri)
@@ -2758,6 +2838,59 @@ async def test_failed_teardown_release_remains_recoverable_after_host_deletion(
     assert launch_store.list_credential_leases(result.host_id) == []
     assert provider.names == set()
     assert len(recovery_hook.release_calls) == 1
+
+
+async def test_recovery_does_not_repeat_completed_provider_release(
+    db_uri: str,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Provider success is durable even when the final tombstone CAS fails."""
+    store = HostStore(db_uri)
+    launcher = FakeSandboxLauncher(on_host_start=_online_register(store))
+    provider = _FakeKubernetesCredentialProvider()
+    result = await launch_managed_host(
+        config=_hook_config(launcher, _FakeProviderCredentialHook(provider)),
+        owner=_OWNER,
+        host_store=store,
+    )
+    host = store.get_host(result.host_id)
+    assert host is not None
+    first_cleanup_hook = _FakeProviderCredentialHook(provider)
+    original_release = store.release_credential_lease
+    monkeypatch.setattr(store, "release_credential_lease", lambda *args, **kwargs: False)
+
+    await terminate_managed_host(
+        host,
+        store,
+        _hook_config(launcher, first_cleanup_hook),
+    )
+
+    retryable = store.list_credential_leases(result.host_id)
+    assert len(retryable) == 1
+    assert retryable[0].state == "retiring"
+    assert retryable[0].credential_cleanup_required is False
+    assert retryable[0].reference is None
+    assert provider.names == set()
+    assert len(first_cleanup_hook.release_calls) == 1
+
+    monkeypatch.setattr(store, "release_credential_lease", original_release)
+    engine = sa.create_engine(db_uri)
+    try:
+        with engine.begin() as connection:
+            connection.execute(
+                sa.text("UPDATE managed_credential_leases SET claim_expires_at = 0")
+            )
+    finally:
+        engine.dispose()
+
+    retry_hook = _FakeProviderCredentialHook(provider)
+    await recover_managed_credential_leases(
+        _hook_config(FakeSandboxLauncher(), retry_hook),
+        store,
+    )
+
+    assert retry_hook.release_calls == []
+    assert store.list_credential_leases(result.host_id) == []
 
 
 async def test_restart_recovery_sweeps_pending_credential_lease(db_uri: str) -> None:
@@ -3580,14 +3713,14 @@ async def test_hung_cleanup_workers_do_not_exhaust_startup_or_db_executor(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """Saturated provider cleanup stays isolated from lifespan and DB work."""
+    """Timed-out daemon workers stay hard-bounded and never block startup."""
     import omnigent.server.managed_hosts as managed_hosts_mod
 
     executor = managed_hosts_mod._BoundedProviderCleanupExecutor(max_workers=2)
     monkeypatch.setattr(managed_hosts_mod, "_PROVIDER_CLEANUP_EXECUTOR", executor)
     monkeypatch.setattr(managed_hosts_mod, "_CREDENTIAL_CLEANUP_TIMEOUT_S", 0.05)
-    gates = [threading.Event(), threading.Event()]
-    entered = [threading.Event(), threading.Event()]
+    gates = [threading.Event(), threading.Event(), threading.Event()]
+    entered = [threading.Event(), threading.Event(), threading.Event()]
     launcher = FakeSandboxLauncher()
 
     def blocking_terminate(sandbox_id: str) -> None:
@@ -3609,13 +3742,36 @@ async def test_hung_cleanup_workers_do_not_exhaust_startup_or_db_executor(
             )
         )
         assert results == [False, False]
-        assert all(event.is_set() for event in entered)
+        assert all(event.is_set() for event in entered[:2])
         assert not await managed_hosts_mod._terminate_sandbox_id_best_effort(
             launcher,
             sandbox_id="sb-hung-2",
             provider=launcher.provider,
             host_id="host-2",
         )
+        assert not entered[2].is_set()
+        # A timed-out call keeps its slot until the provider returns; otherwise
+        # repeated recovery ticks could create unbounded abandoned threads.
+        gates[0].set()
+        for _ in range(100):
+            await managed_hosts_mod._terminate_sandbox_id_best_effort(
+                launcher,
+                sandbox_id="sb-hung-2",
+                provider=launcher.provider,
+                host_id="host-2",
+            )
+            if entered[2].is_set():
+                break
+            await asyncio.sleep(0.01)
+        assert entered[2].is_set()
+        cleanup_threads = [
+            thread
+            for thread in threading.enumerate()
+            if thread.name.startswith("managed-host-cleanup-")
+        ]
+        assert cleanup_threads
+        assert all(thread.daemon for thread in cleanup_threads)
+        await asyncio.wait_for(asyncio.to_thread(executor.shutdown), timeout=0.5)
 
         store = HostStore(db_uri)
         app = _capability_probe_app(db_uri, tmp_path, _hook_config(launcher, None))
@@ -3638,6 +3794,33 @@ async def test_hung_cleanup_workers_do_not_exhaust_startup_or_db_executor(
         await asyncio.to_thread(executor.shutdown)
 
 
+async def test_hung_cleanup_worker_cannot_block_interpreter_shutdown() -> None:
+    """A provider call that never returns cannot keep the server process alive."""
+    script = """
+import threading
+from omnigent.server.managed_hosts import _BoundedProviderCleanupExecutor
+
+executor = _BoundedProviderCleanupExecutor(max_workers=1)
+entered = threading.Event()
+
+def hang_forever():
+    entered.set()
+    threading.Event().wait()
+
+attempt = executor.submit(hang_forever)
+assert attempt is not None
+assert entered.wait(timeout=1)
+"""
+    await asyncio.to_thread(
+        subprocess.run,
+        [sys.executable, "-c", script],
+        check=True,
+        capture_output=True,
+        text=True,
+        timeout=2,
+    )
+
+
 async def test_cancelled_start_waits_for_provider_worker_before_cleanup(
     db_uri: str,
     monkeypatch: pytest.MonkeyPatch,
@@ -3649,7 +3832,7 @@ async def test_cancelled_start_waits_for_provider_worker_before_cleanup(
     launcher = FakeSandboxLauncher(on_host_start=_online_register(host_store))
     original_start = launcher.start_host
 
-    def blocking_start(*args: object, **kwargs: object) -> str:
+    def blocking_start(*args: Any, **kwargs: Any) -> str:
         entered.set()
         assert gate.wait(timeout=5), "test never released the start gate"
         return original_start(*args, **kwargs)  # type: ignore[arg-type]
@@ -3723,7 +3906,10 @@ async def test_failed_sandbox_termination_remains_recoverable(
     assert host_store.list_credential_leases(result.host_id) == []
 
 
-async def test_hook_failure_aborts_launch_and_tears_down_sandbox(db_uri: str) -> None:
+async def test_hook_failure_aborts_launch_without_exposing_secret(
+    db_uri: str,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
     """
     A hook that cannot resolve credentials aborts the launch through the same
     cleanup any post-provision failure takes: the sandbox is terminated, the
@@ -3732,7 +3918,17 @@ async def test_hook_failure_aborts_launch_and_tears_down_sandbox(db_uri: str) ->
     """
     host_store = HostStore(db_uri)
     fake = FakeSandboxLauncher(on_host_start=_online_register(host_store))
-    hook = _FakeCredentialHook(fail=True)
+    secret = "credential-provider-error-secret"
+
+    class _SecretFailingHook(_FakeCredentialHook):
+        async def acquire(
+            self,
+            context: ManagedLaunchContext,
+            generation: int,
+        ) -> ManagedCredentialLease:
+            raise RuntimeError(f"credential resolution failed: {secret}")
+
+    hook = _SecretFailingHook()
 
     with pytest.raises(HTTPException) as exc:
         await launch_managed_host(
@@ -3742,7 +3938,9 @@ async def test_hook_failure_aborts_launch_and_tears_down_sandbox(db_uri: str) ->
         )
 
     assert exc.value.status_code == 502
-    assert "credential resolution failed" in exc.value.detail
+    assert "managed credential acquisition failed" in exc.value.detail
+    assert secret not in exc.value.detail
+    assert secret not in caplog.text
     # Provisioned, then torn down: no paid compute leaks past the failed acquire.
     assert fake.terminated == ["sb-fake-1"]
     # The host never started (acquire runs before start_host).
@@ -3772,6 +3970,60 @@ async def test_hook_failure_after_provider_create_leaves_zero_orphans(db_uri: st
     assert hook.release_calls[0][1:] == (1, None)
 
 
+async def test_hung_credential_acquisition_times_out_and_cleans_launch(db_uri: str) -> None:
+    """A cancellation-safe hung hook cannot heartbeat a pending lease forever."""
+
+    class _HangingHook(_FakeCredentialHook):
+        def __init__(self) -> None:
+            super().__init__()
+            self.started = asyncio.Event()
+            self.cancelled = False
+
+        async def acquire(
+            self,
+            context: ManagedLaunchContext,
+            generation: int,
+        ) -> ManagedCredentialLease:
+            self.contexts.append(context)
+            self.generations.append(generation)
+            self.started.set()
+            try:
+                await asyncio.Event().wait()
+            except asyncio.CancelledError:
+                self.cancelled = True
+                raise
+            raise AssertionError("unreachable")
+
+    host_store = HostStore(db_uri)
+    launcher = FakeSandboxLauncher(on_host_start=_online_register(host_store))
+    hook = _HangingHook()
+
+    with pytest.raises(HTTPException) as exc:
+        await launch_managed_host(
+            config=_hook_config(
+                launcher,
+                hook,
+                acquisition_timeout_s=0.05,
+            ),
+            owner=_OWNER,
+            host_store=host_store,
+        )
+
+    assert hook.started.is_set()
+    assert hook.cancelled
+    assert exc.value.status_code == 502
+    assert (
+        exc.value.detail
+        == "managed sandbox host startup failed: managed credential acquisition failed"
+    )
+    assert launcher.host_starts == []
+    assert launcher.terminated == ["sb-fake-1"]
+    assert host_store.list_hosts(_OWNER) == []
+    assert host_store.list_credential_leases() == []
+    assert len(hook.release_calls) == 1
+    assert hook.release_calls[0][2] is None
+
+
 async def test_start_host_failure_after_acquire_releases_lease(db_uri: str) -> None:
     """
     When the launch fails AFTER the lease was acquired (the in-sandbox host
@@ -3794,6 +4046,53 @@ async def test_start_host_failure_after_acquire_releases_lease(db_uri: str) -> N
     assert lease.release_calls == 1
     assert fake.terminated == ["sb-fake-1"]
     assert host_store.list_hosts(_OWNER) == []
+    assert host_store.list_credential_leases() == []
+
+
+async def test_launch_failure_defers_credential_release_until_sandbox_termination(
+    db_uri: str,
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """A failed provider teardown leaves credentials live and retryable."""
+    host_store = HostStore(db_uri)
+    launcher = FakeSandboxLauncher(fail_on_host_start=True)
+    terminate = launcher.terminate
+    lease = _FakeCredentialLease()
+    hook = _FakeCredentialHook(lease)
+    config = _hook_config(launcher, hook)
+
+    provider_secret = "provider-control-plane-secret"
+
+    def fail_termination(_sandbox_id: str) -> None:
+        raise RuntimeError(f"provider control plane unavailable: {provider_secret}")
+
+    monkeypatch.setattr(launcher, "terminate", fail_termination)
+    with pytest.raises(HTTPException):
+        await launch_managed_host(config=config, owner=_OWNER, host_store=host_store)
+
+    assert lease.release_calls == 0
+    assert hook.release_calls == []
+    assert provider_secret not in caplog.text
+    records = host_store.list_credential_leases()
+    assert [(record.state, record.reference) for record in records] == [
+        ("retiring", "managed-cred-abc123")
+    ]
+
+    engine = sa.create_engine(db_uri)
+    try:
+        with engine.begin() as connection:
+            connection.execute(
+                sa.text("UPDATE managed_credential_leases SET claim_expires_at = 0")
+            )
+    finally:
+        engine.dispose()
+    monkeypatch.setattr(launcher, "terminate", terminate)
+
+    await recover_managed_credential_leases(config, HostStore(db_uri))
+
+    assert launcher.terminated == ["sb-fake-1"]
+    assert len(hook.release_calls) == 1
     assert host_store.list_credential_leases() == []
 
 
@@ -3826,3 +4125,114 @@ async def test_relaunch_start_host_failure_releases_lease_keeps_row(db_uri: str)
     # Durable row survives the failed relaunch.
     assert host_store.get_host(first.host_id) is not None
     assert host_store.list_credential_leases(first.host_id) == []
+
+
+async def test_cancellation_settles_late_registration_commit(
+    db_uri: str,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Cancellation during registration waits for its commit before teardown."""
+    host_store = HostStore(db_uri)
+    launcher = FakeSandboxLauncher()
+    hook = _FakeCredentialHook()
+    entered = threading.Event()
+    unblock = threading.Event()
+    original = host_store.register_managed_host
+
+    def blocking_register(*args: Any, **kwargs: Any) -> object:
+        entered.set()
+        assert unblock.wait(timeout=2.0)
+        return original(*args, **kwargs)
+
+    monkeypatch.setattr(host_store, "register_managed_host", blocking_register)
+    task = asyncio.create_task(
+        launch_managed_host(
+            config=_hook_config(launcher, hook),
+            owner=_OWNER,
+            host_store=host_store,
+        )
+    )
+    assert await asyncio.to_thread(entered.wait, 2.0)
+    task.cancel()
+    unblock.set()
+
+    with pytest.raises(asyncio.CancelledError):
+        await task
+
+    assert launcher.terminated == ["sb-fake-1"]
+    assert len(hook.release_calls) == 1
+    assert host_store.list_hosts(_OWNER) == []
+    assert host_store.list_credential_leases() == []
+
+
+async def test_cancellation_settles_late_activation_commit(
+    db_uri: str,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Cancellation during activation cleans the generation after its late commit."""
+    host_store = HostStore(db_uri)
+    launcher = FakeSandboxLauncher(on_host_start=_online_register(host_store))
+    lease = _FakeCredentialLease()
+    entered = threading.Event()
+    unblock = threading.Event()
+    original = host_store.activate_credential_lease
+
+    def blocking_activate(*args: Any, **kwargs: Any) -> object:
+        entered.set()
+        assert unblock.wait(timeout=2.0)
+        return original(*args, **kwargs)
+
+    monkeypatch.setattr(host_store, "activate_credential_lease", blocking_activate)
+    task = asyncio.create_task(
+        launch_managed_host(
+            config=_hook_config(launcher, _FakeCredentialHook(lease)),
+            owner=_OWNER,
+            host_store=host_store,
+        )
+    )
+    assert await asyncio.to_thread(entered.wait, 2.0)
+    task.cancel()
+    unblock.set()
+
+    with pytest.raises(asyncio.CancelledError):
+        await task
+
+    assert launcher.terminated == ["sb-fake-1"]
+    assert lease.release_calls == 1
+    assert host_store.list_hosts(_OWNER) == []
+    assert host_store.list_credential_leases() == []
+
+
+async def test_credential_acquisition_timeout_releases_deterministic_resource(
+    db_uri: str,
+) -> None:
+    """A cancelled acquire is bounded and cleanup reconstructs its provider identity."""
+    host_store = HostStore(db_uri)
+    launcher = FakeSandboxLauncher()
+    provider = _FakeKubernetesCredentialProvider()
+
+    class _SlowAcquireHook(_FakeProviderCredentialHook):
+        async def acquire(
+            self,
+            context: ManagedLaunchContext,
+            generation: int,
+        ) -> ManagedCredentialLease:
+            self.provider.create(context, generation)
+            await asyncio.sleep(3600)
+            raise AssertionError("unreachable")
+
+    hook = _SlowAcquireHook(provider)
+    config = dataclasses.replace(
+        _hook_config(launcher, hook),
+        credential_acquisition_timeout_s=0.01,
+    )
+
+    with pytest.raises(HTTPException) as exc_info:
+        await launch_managed_host(config=config, owner=_OWNER, host_store=host_store)
+
+    assert exc_info.value.status_code == 502
+    assert provider.names == set()
+    assert len(hook.release_calls) == 1
+    assert launcher.terminated == ["sb-fake-1"]
+    assert host_store.list_hosts(_OWNER) == []
+    assert host_store.list_credential_leases() == []

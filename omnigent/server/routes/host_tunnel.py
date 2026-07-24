@@ -156,6 +156,9 @@ def create_host_tunnel_router(
         # only the handshake headers/cookies, which Starlette exposes before
         # ``accept()``.
         managed_token = ws.headers.get(MANAGED_HOST_TOKEN_HEADER)
+        authenticated_user_id = (
+            auth_provider.get_user_id(ws) if auth_provider is not None else None
+        )
         if managed_token is not None:
             # A managed-host launch token is an explicit credential: when
             # presented, it must resolve — never fall through to user auth
@@ -165,14 +168,17 @@ def create_host_tunnel_router(
             # THIS path's host_id, so presenting it for any other path
             # fails closed — a leaked token cannot register arbitrary hosts.
             managed = await asyncio.to_thread(
-                host_store.resolve_launch_token, host_id, managed_token
+                host_store.resolve_launch_token,
+                host_id,
+                managed_token,
+                expected_user_id=authenticated_user_id,
             )
             if managed is None:
                 await ws.close(code=4004, reason="unauthenticated")
                 return
             tunnel_owner = managed.user_id
         elif auth_provider is not None:
-            tunnel_owner = auth_provider.get_user_id(ws)
+            tunnel_owner = authenticated_user_id
             if tunnel_owner is None:
                 # Auth is enabled but this peer didn't authenticate. Fail
                 # closed — never fall back to RESERVED_USER_LOCAL, which is
@@ -243,14 +249,27 @@ def create_host_tunnel_router(
                 )
                 return
 
-            await asyncio.to_thread(
-                host_store.upsert_on_connect,
-                host_id=host_id,
-                name=frame.name,
-                user_id=tunnel_owner,
-                allow_host_id_reown=allow_host_id_reown,
-                configured_harnesses=frame.configured_harnesses,
-            )
+            if managed_token is not None:
+                connected = await asyncio.to_thread(
+                    host_store.connect_managed_host,
+                    host_id,
+                    managed_token,
+                    frame.name,
+                    expected_user_id=tunnel_owner,
+                    configured_harnesses=frame.configured_harnesses,
+                )
+                if connected is None:
+                    await ws.close(code=4004, reason="managed credential changed")
+                    return
+            else:
+                await asyncio.to_thread(
+                    host_store.upsert_on_connect,
+                    host_id=host_id,
+                    name=frame.name,
+                    user_id=tunnel_owner,
+                    allow_host_id_reown=allow_host_id_reown,
+                    configured_harnesses=frame.configured_harnesses,
+                )
 
             conn = host_registry.register(
                 host_id,

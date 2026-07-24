@@ -132,6 +132,7 @@ import time
 import uuid
 from collections.abc import Callable
 from dataclasses import dataclass, replace
+from dataclasses import field as dataclass_field
 from typing import TYPE_CHECKING, Any, TypeVar
 from urllib.parse import urlsplit
 
@@ -181,6 +182,7 @@ PROVIDERS_WITH_MANAGED_LAUNCH: frozenset[str] = frozenset(
 # cold registry pull of the image on first use.
 MANAGED_HOST_ONLINE_TIMEOUT_S = 120
 _ONLINE_POLL_INTERVAL_S = 1.0
+_CREDENTIAL_ACQUISITION_TIMEOUT_S = 120.0
 _CREDENTIAL_CLEANUP_TIMEOUT_S = 10.0
 _CREDENTIAL_CLAIM_TTL_S = 120
 _CREDENTIAL_PENDING_STALE_S = 300
@@ -192,43 +194,96 @@ _PROVIDER_CLEANUP_MAX_WORKERS = 4
 _T = TypeVar("_T")
 
 
+@dataclass
+class _ProviderCleanupAttempt:
+    """A daemon cleanup call that owns capacity until provider code returns."""
+
+    future: concurrent.futures.Future[Any]
+    _slots: threading.BoundedSemaphore
+    _slot_released: bool = False
+    _lock: threading.Lock = dataclass_field(default_factory=threading.Lock)
+
+    def release_slot(self) -> None:
+        """Return capacity exactly once after the underlying call settles."""
+        with self._lock:
+            if self._slot_released:
+                return
+            self._slot_released = True
+            self._slots.release()
+
+
 class _BoundedProviderCleanupExecutor:
-    """Keep blocking provider cleanup off asyncio's shared executor."""
+    """Run provider cleanup on a hard-bounded set of daemon workers.
+
+    Timed-out calls retain their slots. This deliberately prefers a failed-fast
+    durable retry over creating an unbounded number of abandoned threads when a
+    provider SDK hangs. Daemon workers cannot hold interpreter shutdown open.
+    """
 
     def __init__(self, max_workers: int) -> None:
-        self._executor = concurrent.futures.ThreadPoolExecutor(
-            max_workers=max_workers,
-            thread_name_prefix="managed-host-cleanup",
-        )
         self._slots = threading.BoundedSemaphore(max_workers)
+        self._lock = threading.Lock()
+        self._shutdown = False
+        self._sequence = 0
 
     def submit(
         self,
         function: Callable[..., Any],
         *args: Any,
-    ) -> concurrent.futures.Future[Any] | None:
+    ) -> _ProviderCleanupAttempt | None:
         """Submit only when a worker slot is available without queuing."""
         if not self._slots.acquire(blocking=False):
             return None
-        try:
-            future = self._executor.submit(function, *args)
-        except BaseException:
-            self._slots.release()
-            raise
-        future.add_done_callback(self._release_slot)
-        return future
+        with self._lock:
+            if self._shutdown:
+                self._slots.release()
+                raise RuntimeError("provider cleanup executor is shut down")
+            sequence = self._sequence
+            self._sequence += 1
 
-    def _release_slot(self, _future: concurrent.futures.Future[Any]) -> None:
-        self._slots.release()
+        future: concurrent.futures.Future[Any] = concurrent.futures.Future()
+        attempt = _ProviderCleanupAttempt(future=future, _slots=self._slots)
+
+        def run() -> None:
+            if not future.set_running_or_notify_cancel():
+                attempt.release_slot()
+                return
+            try:
+                result = function(*args)
+            except BaseException as exc:  # noqa: BLE001 — worker boundary must
+                # settle the Future even for a provider's non-Exception escape.
+                future.set_exception(exc)
+            else:
+                future.set_result(result)
+            finally:
+                attempt.release_slot()
+
+        thread = threading.Thread(
+            target=run,
+            name=f"managed-host-cleanup-{sequence}",
+            daemon=True,
+        )
+        try:
+            thread.start()
+        except BaseException:
+            attempt.release_slot()
+            raise
+        return attempt
 
     def shutdown(self) -> None:
-        """Wait for submitted cleanup calls and stop worker threads."""
-        self._executor.shutdown(wait=True, cancel_futures=True)
+        """Reject new work without waiting for unkillable provider calls."""
+        with self._lock:
+            self._shutdown = True
 
 
 _PROVIDER_CLEANUP_EXECUTOR = _BoundedProviderCleanupExecutor(
     max_workers=_PROVIDER_CLEANUP_MAX_WORKERS
 )
+_BACKGROUND_CREDENTIAL_TASKS: set[asyncio.Task[Any]] = set()
+
+
+class _CredentialAcquisitionError(RuntimeError):
+    """Secret-safe wrapper for deployment credential-hook failures."""
 
 
 # Launch-token lifetime for the YAML modal path: Modal's 24h sandbox
@@ -463,6 +518,9 @@ class ManagedSandboxConfig:
         reference is exposed to launcher startup. ``None`` (the default,
         and the only value the YAML path produces) keeps the original
         behavior — no credentials are resolved and no lease is acquired.
+    :param credential_acquisition_timeout_s: Maximum seconds to wait for
+        ``credential_hook.acquire``. Hooks must honor task cancellation so a
+        timed-out producer cannot create credentials after launch cleanup.
     """
 
     server_url: str
@@ -472,6 +530,7 @@ class ManagedSandboxConfig:
     provider: str | None = None
     host_config: dict[str, object] | None = None
     credential_hook: ManagedCredentialHook | None = None
+    credential_acquisition_timeout_s: float = _CREDENTIAL_ACQUISITION_TIMEOUT_S
 
 
 @dataclass
@@ -2070,6 +2129,7 @@ async def relaunch_managed_host(
         claim_owner=cleanup_owner,
         claim_expires_at=now_epoch() + _CREDENTIAL_CLAIM_TTL_S,
         expected_sandbox_id=host.sandbox_id,
+        expected_provider=host.sandbox_provider,
     )
     outstanding_predecessors = await asyncio.to_thread(
         host_store.list_credential_leases,
@@ -2279,6 +2339,7 @@ async def _acquire_credential_lease(
     hook: ManagedCredentialHook,
     context: ManagedLaunchContext,
     generation: int,
+    timeout_s: float,
 ) -> ManagedCredentialLease:
     """Resolve the per-launch credential lease.
 
@@ -2288,9 +2349,44 @@ async def _acquire_credential_lease(
 
     :param hook: The configured credential resolver.
     :param context: The immutable launch identity to resolve against.
+    :param timeout_s: Maximum acquisition duration in seconds.
     :returns: The acquired lease.
     """
-    return await hook.acquire(context, generation)
+    acquisition = asyncio.create_task(hook.acquire(context, generation))
+    try:
+        done, _pending = await asyncio.wait({acquisition}, timeout=timeout_s)
+    except asyncio.CancelledError:
+        acquisition.cancel()
+        _track_late_credential_acquisition(acquisition)
+        raise
+    if acquisition not in done:
+        acquisition.cancel()
+        _track_late_credential_acquisition(acquisition)
+        raise _CredentialAcquisitionError("managed credential acquisition failed")
+    try:
+        return acquisition.result()
+    except Exception:  # noqa: BLE001 — hook errors may contain credential material
+        raise _CredentialAcquisitionError("managed credential acquisition failed") from None
+
+
+def _track_late_credential_acquisition(
+    acquisition: asyncio.Task[ManagedCredentialLease],
+) -> None:
+    """Release a lease returned after its launch was cancelled or timed out."""
+    _BACKGROUND_CREDENTIAL_TASKS.add(acquisition)
+
+    def acquisition_settled(task: asyncio.Task[ManagedCredentialLease]) -> None:
+        _BACKGROUND_CREDENTIAL_TASKS.discard(task)
+        try:
+            lease = task.result()
+        except (asyncio.CancelledError, Exception):  # noqa: BLE001 — discard a
+            # cancelled or failed producer without retaining secret-bearing errors.
+            return
+        cleanup = asyncio.create_task(_release_lease_best_effort(lease))
+        _BACKGROUND_CREDENTIAL_TASKS.add(cleanup)
+        cleanup.add_done_callback(_BACKGROUND_CREDENTIAL_TASKS.discard)
+
+    acquisition.add_done_callback(acquisition_settled)
 
 
 async def _release_lease_best_effort(lease: ManagedCredentialLease | None) -> bool:
@@ -2311,7 +2407,7 @@ async def _release_lease_best_effort(lease: ManagedCredentialLease | None) -> bo
     except Exception:  # noqa: BLE001 — cleanup boundary: a hook's release must
         # never mask the launch failure being handled. Do not attach the hook's
         # exception: a broken implementation may include credential material.
-        _logger.warning("Failed to release managed credential lease %r", lease)
+        _logger.warning("Failed to release managed credential lease")
         return False
     return True
 
@@ -2399,6 +2495,25 @@ async def _release_stored_credential_leases(
                 )
                 all_released = False
                 continue
+            cleanup_recorded = await asyncio.to_thread(
+                host_store.complete_credential_lease_cleanup,
+                record.host_id,
+                record.generation,
+                claim_owner=claim_owner,
+            )
+            if not cleanup_recorded:
+                _logger.warning(
+                    "Managed credential cleanup lost CAS for host %s generation %s",
+                    record.host_id,
+                    record.generation,
+                )
+                all_released = False
+                continue
+            record = replace(
+                record,
+                credential_cleanup_required=False,
+                reference=None,
+            )
         renewed_record = await _renew_credential_cleanup_claim(record, host_store)
         if renewed_record is None:
             _logger.warning(
@@ -2568,6 +2683,7 @@ async def _arm_and_start_host(
     owner_token = secrets.token_urlsafe(24)
     registered_host: Host | None = None
     lease: ManagedCredentialLease | None = None
+    credential_reference: str | None = None
     lease_record: CredentialLeaseRecord | None = None
     owner_heartbeat: _CredentialOwnerHeartbeat | None = None
     try:
@@ -2592,7 +2708,7 @@ async def _arm_and_start_host(
         owner_heartbeat = _CredentialOwnerHeartbeat(host_store, lease_record)
         owner_heartbeat.start()
 
-        registered_host = await asyncio.to_thread(
+        registered_host, registration_cancelled = await _to_thread_settled(
             host_store.register_managed_host,
             host_id=host_id,
             name=context.host_name,
@@ -2604,6 +2720,8 @@ async def _arm_and_start_host(
             expected_sandbox_id=expected_sandbox_id,
             require_absent=expected_sandbox_id is None,
         )
+        if registration_cancelled:
+            raise asyncio.CancelledError
         if cancel_after_arm:
             raise asyncio.CancelledError
 
@@ -2612,12 +2730,21 @@ async def _arm_and_start_host(
                 config.credential_hook,
                 context,
                 lease_record.generation,
+                config.credential_acquisition_timeout_s,
             )
+            try:
+                credential_reference = lease.reference
+            except Exception:  # noqa: BLE001 — provider errors may contain credential material
+                raise _CredentialAcquisitionError(
+                    "managed credential reference resolution failed"
+                ) from None
+            if credential_reference is not None and not isinstance(credential_reference, str):
+                raise _CredentialAcquisitionError("managed credential reference resolution failed")
             stored = await asyncio.to_thread(
                 host_store.set_credential_lease_reference,
                 host_id,
                 lease_record.generation,
-                lease.reference,
+                credential_reference,
                 owner_token,
             )
             if not stored:
@@ -2631,7 +2758,7 @@ async def _arm_and_start_host(
         if config.host_config is not None:
             optional_start_kwargs["host_config"] = config.host_config
         if lease is not None:
-            optional_start_kwargs["credential_reference"] = lease.reference
+            optional_start_kwargs["credential_reference"] = credential_reference
         # Uniform across providers: provision() fixed the sandbox id and the
         # token was armed against it above, so start_host starts the host with
         # a token that already resolves. The exec-model default execs in; the
@@ -2660,7 +2787,7 @@ async def _arm_and_start_host(
             await owner_heartbeat.renew()
             await owner_heartbeat.stop()
             owner_heartbeat = None
-            activated = await asyncio.to_thread(
+            activated, activation_cancelled = await _to_thread_settled(
                 host_store.activate_credential_lease,
                 host_id,
                 lease_record.generation,
@@ -2669,6 +2796,8 @@ async def _arm_and_start_host(
             )
             if not activated:
                 raise RuntimeError("managed credential lease ownership changed before activation")
+            if activation_cancelled:
+                raise asyncio.CancelledError
     except BaseException as exc:
         # Broad on purpose: any post-provision failure or task cancellation — a raising credential
         # hook, launcher CLI errors, provider SDK exceptions (e.g. Modal's
@@ -2690,6 +2819,23 @@ async def _arm_and_start_host(
                 claim_owner=owner_token,
                 claim_expires_at=now_epoch() + _CREDENTIAL_CLAIM_TTL_S,
             )
+            if claimed is None:
+                active_claims = await asyncio.to_thread(
+                    host_store.claim_active_credential_leases,
+                    host_id,
+                    claim_owner=owner_token,
+                    claim_expires_at=now_epoch() + _CREDENTIAL_CLAIM_TTL_S,
+                    expected_sandbox_id=sandbox_id,
+                    expected_provider=launcher.provider,
+                )
+                claimed = next(
+                    (
+                        record
+                        for record in active_claims
+                        if record.generation == lease_record.generation
+                    ),
+                    None,
+                )
         may_cleanup_provider = lease_record is None or claimed is not None
         terminated = False
         if may_cleanup_provider:
@@ -2724,35 +2870,58 @@ async def _arm_and_start_host(
                         host_id,
                         sandbox_id,
                     )
-        released = await _release_lease_best_effort(lease)
-        if released and claimed is not None and terminated:
-            renewed_claim = await _renew_credential_cleanup_claim(claimed, host_store)
-            if renewed_claim is None:
-                _logger.warning(
-                    "Managed credential release lost claim after provider release for host %s "
-                    "generation %s; leaving the row retryable",
-                    host_id,
-                    claimed.generation,
-                )
-            else:
-                finalized = await asyncio.to_thread(
-                    host_store.release_credential_lease,
+        # Keep credentials live until provider teardown succeeds. Releasing
+        # first can strand a still-running sandbox without its projected
+        # credential and violates the ordering used by every teardown path.
+        if terminated:
+            released = await _release_lease_best_effort(lease)
+            if released and claimed is not None:
+                cleanup_recorded = await asyncio.to_thread(
+                    host_store.complete_credential_lease_cleanup,
                     host_id,
                     claimed.generation,
                     claim_owner=owner_token,
                 )
-                if not finalized:
+                if not cleanup_recorded:
                     _logger.warning(
-                        "Managed credential release lost CAS for host %s generation %s",
+                        "Managed credential cleanup lost CAS for host %s generation %s",
                         host_id,
                         claimed.generation,
                     )
-        elif not released and claimed is not None and terminated:
-            await _release_stored_credential_leases(
-                config,
-                host_store,
-                [claimed],
-            )
+                    released = False
+            if released and claimed is not None:
+                claimed = replace(
+                    claimed,
+                    credential_cleanup_required=False,
+                    reference=None,
+                )
+                renewed_claim = await _renew_credential_cleanup_claim(claimed, host_store)
+                if renewed_claim is None:
+                    _logger.warning(
+                        "Managed credential release lost claim after provider release for host %s "
+                        "generation %s; leaving the row retryable",
+                        host_id,
+                        claimed.generation,
+                    )
+                else:
+                    finalized = await asyncio.to_thread(
+                        host_store.release_credential_lease,
+                        host_id,
+                        claimed.generation,
+                        claim_owner=owner_token,
+                    )
+                    if not finalized:
+                        _logger.warning(
+                            "Managed credential release lost CAS for host %s generation %s",
+                            host_id,
+                            claimed.generation,
+                        )
+            elif not released and claimed is not None:
+                await _release_stored_credential_leases(
+                    config,
+                    host_store,
+                    [claimed],
+                )
         if owner_lost:
             raise HTTPException(
                 status_code=502,
@@ -2766,7 +2935,7 @@ async def _arm_and_start_host(
         raise HTTPException(
             status_code=502,
             detail=f"managed sandbox host startup failed: {message}",
-        ) from exc
+        ) from (None if isinstance(exc, _CredentialAcquisitionError) else exc)
     return workspace
 
 
@@ -3022,6 +3191,7 @@ async def terminate_managed_host(
         claim_owner=claim_owner,
         claim_expires_at=now_epoch() + _CREDENTIAL_CLAIM_TTL_S,
         expected_sandbox_id=host.sandbox_id,
+        expected_provider=host.sandbox_provider,
     )
     launcher = _launcher_for_teardown(host, config)
     terminated = await _terminate_sandbox_best_effort(launcher, host)
@@ -3092,8 +3262,8 @@ async def _terminate_sandbox_id_best_effort(
 ) -> bool:
     """Bound one provider termination attempt without discarding retry identity."""
     if launcher is not None:
-        cleanup_future = _PROVIDER_CLEANUP_EXECUTOR.submit(launcher.terminate, sandbox_id)
-        if cleanup_future is None:
+        cleanup_attempt = _PROVIDER_CLEANUP_EXECUTOR.submit(launcher.terminate, sandbox_id)
+        if cleanup_attempt is None:
             _logger.warning(
                 "Skipping managed sandbox %s termination (provider=%s) for host %s: "
                 "provider cleanup capacity is exhausted",
@@ -3104,10 +3274,12 @@ async def _terminate_sandbox_id_best_effort(
             return False
         try:
             await asyncio.wait_for(
-                asyncio.wrap_future(cleanup_future),
+                asyncio.wrap_future(cleanup_attempt.future),
                 timeout=_CREDENTIAL_CLEANUP_TIMEOUT_S,
             )
             return True
+        except asyncio.CancelledError:
+            raise
         except Exception:  # noqa: BLE001 — deliberate broad catch: this is a
             # provider-API boundary on a cleanup path. The provider SDK can
             # fail here in many shapes (auth/config ClickException, network
@@ -3118,7 +3290,6 @@ async def _terminate_sandbox_id_best_effort(
                 sandbox_id,
                 provider,
                 host_id,
-                exc_info=True,
             )
             return False
     else:

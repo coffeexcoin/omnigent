@@ -142,8 +142,11 @@ _logger = logging.getLogger(__name__)
 
 
 def _rowcount(result: Any) -> int:
-    """Return affected rows for SQLAlchemy DML results."""
-    return int(getattr(result, "rowcount", 0))
+    """Return a safe affected-row count for dialect-specific DML results."""
+    rowcount = getattr(result, "rowcount", None)
+    if not isinstance(rowcount, int) or rowcount < 0:
+        return 0
+    return rowcount
 
 
 def _parse_configured_harnesses(raw: str | None) -> dict[str, HarnessAvailability] | None:
@@ -466,6 +469,7 @@ class HostStore:
                 SqlHost.workspace_id == current_workspace_id(),
                 SqlHost.host_id == host_id,
                 SqlHost.sandbox_id == SqlManagedCredentialLease.sandbox_id,
+                SqlHost.sandbox_provider == SqlManagedCredentialLease.sandbox_provider,
                 SqlHost.status == encode_host_status("online"),
             )
             .exists()
@@ -486,6 +490,10 @@ class HostStore:
                     ),
                     SqlManagedCredentialLease.state
                     == encode_managed_credential_lease_state("pending"),
+                    or_(
+                        SqlManagedCredentialLease.credential_cleanup_required.is_(False),
+                        SqlManagedCredentialLease.reference.is_not(None),
+                    ),
                     exact_online_binding,
                 )
                 .values(
@@ -502,6 +510,7 @@ class HostStore:
         claim_owner: str,
         claim_expires_at: int,
         expected_sandbox_id: str | None = None,
+        expected_provider: str | None = None,
     ) -> list[CredentialLeaseRecord]:
         """Claim active or abandoned cleanup generations for one sandbox."""
         workspace_id = current_workspace_id()
@@ -512,6 +521,11 @@ class HostStore:
             SqlManagedCredentialLease.sandbox_id.is_not(None)
             if expected_sandbox_id is None
             else SqlManagedCredentialLease.sandbox_id == expected_sandbox_id
+        )
+        provider_binding = (
+            SqlManagedCredentialLease.sandbox_provider.is_not(None)
+            if expected_provider is None
+            else SqlManagedCredentialLease.sandbox_provider == expected_provider
         )
         active_state = encode_managed_credential_lease_state("active")
         cleanup_states = (
@@ -534,6 +548,7 @@ class HostStore:
                     SqlManagedCredentialLease.workspace_id == workspace_id,
                     SqlManagedCredentialLease.host_id == host_id,
                     sandbox_binding,
+                    provider_binding,
                     claimable,
                 )
             ).all()
@@ -546,6 +561,7 @@ class HostStore:
                         SqlManagedCredentialLease.host_id == row.host_id,
                         SqlManagedCredentialLease.generation == row.generation,
                         sandbox_binding,
+                        provider_binding,
                         claimable,
                     )
                     .values(
@@ -638,6 +654,40 @@ class HostStore:
             )
             return _rowcount(result) == 1
 
+    def complete_credential_lease_cleanup(
+        self,
+        host_id: str,
+        generation: int,
+        *,
+        claim_owner: str,
+    ) -> bool:
+        """Persist provider cleanup before the separate tombstone CAS."""
+        now = now_epoch()
+        with self._session() as session:
+            result = session.execute(
+                update(SqlManagedCredentialLease)
+                .where(
+                    SqlManagedCredentialLease.workspace_id == current_workspace_id(),
+                    SqlManagedCredentialLease.host_id == host_id,
+                    SqlManagedCredentialLease.generation == generation,
+                    SqlManagedCredentialLease.claim_owner == claim_owner,
+                    SqlManagedCredentialLease.claim_expires_at > now,
+                    SqlManagedCredentialLease.credential_cleanup_required.is_(True),
+                    SqlManagedCredentialLease.state.in_(
+                        (
+                            encode_managed_credential_lease_state("retiring"),
+                            encode_managed_credential_lease_state("recovering"),
+                        )
+                    ),
+                )
+                .values(
+                    credential_cleanup_required=False,
+                    reference=None,
+                    updated_at=now,
+                )
+            )
+            return _rowcount(result) == 1
+
     def release_credential_lease(
         self,
         host_id: str,
@@ -697,6 +747,7 @@ class HostStore:
                 SqlHost.workspace_id == workspace_id,
                 SqlHost.host_id == SqlManagedCredentialLease.host_id,
                 SqlHost.sandbox_id == SqlManagedCredentialLease.sandbox_id,
+                SqlHost.sandbox_provider == SqlManagedCredentialLease.sandbox_provider,
             )
             .exists()
         )
@@ -1337,7 +1388,13 @@ class HostStore:
             session.add(row)
             return _row_to_host(row)
 
-    def resolve_launch_token(self, host_id: str, token: str) -> Host | None:
+    def resolve_launch_token(
+        self,
+        host_id: str,
+        token: str,
+        *,
+        expected_user_id: str | None = None,
+    ) -> Host | None:
         """
         Resolve a launch token presented for *host_id* to its managed host.
 
@@ -1354,6 +1411,8 @@ class HostStore:
         :param host_id: The host the peer claims to be, from the tunnel
             path, e.g. ``"host_a1b2c3d4..."``.
         :param token: The raw token presented by the connecting host.
+        :param expected_user_id: Authenticated owner to bind the capability
+            to when the transport also carries user authentication.
         :returns: The matching :class:`Host` whose token is unexpired,
             or ``None`` when the host is unknown, the token does not match,
             or the token is expired.
@@ -1363,6 +1422,11 @@ class HostStore:
                 select(SqlHost).where(
                     SqlHost.workspace_id == current_workspace_id(),
                     SqlHost.host_id == host_id,
+                    (
+                        SqlHost.user_id == expected_user_id
+                        if expected_user_id is not None
+                        else True
+                    ),
                 )
             ).scalar_one_or_none()
             # token_expires_at is written together with token_hash, so a
@@ -1375,6 +1439,51 @@ class HostStore:
                 return None
             if row.token_expires_at < now_epoch():
                 return None
+            return _row_to_host(row)
+
+    def connect_managed_host(
+        self,
+        host_id: str,
+        token: str,
+        name: str,
+        *,
+        expected_user_id: str | None = None,
+        configured_harnesses: dict[str, HarnessAvailability] | None = None,
+    ) -> Host | None:
+        """Validate the current launch token and mark its exact host generation online.
+
+        Authentication and the online transition share one writer transaction.
+        A token rotated after the WebSocket handshake therefore cannot connect the
+        replacement sandbox generation with stale authority.
+
+        :returns: The connected host, or ``None`` if the token is unknown,
+            expired, revoked, or was rotated before this transaction.
+        """
+        now = now_epoch()
+        harnesses_json = (
+            json.dumps(configured_harnesses) if configured_harnesses is not None else None
+        )
+        with self._write_session() as session:
+            row = session.execute(
+                select(SqlHost)
+                .where(
+                    SqlHost.workspace_id == current_workspace_id(),
+                    SqlHost.host_id == host_id,
+                )
+                .with_for_update()
+            ).scalar_one_or_none()
+            if row is None or row.token_hash is None or row.token_expires_at is None:
+                return None
+            if expected_user_id is not None and row.user_id != expected_user_id:
+                return None
+            if row.token_expires_at < now:
+                return None
+            if not hmac.compare_digest(row.token_hash, hash_host_launch_token(token)):
+                return None
+            row.name = name
+            row.status = encode_host_status("online")
+            row.updated_at = now
+            row.configured_harnesses = harnesses_json
             return _row_to_host(row)
 
     def delete_host(

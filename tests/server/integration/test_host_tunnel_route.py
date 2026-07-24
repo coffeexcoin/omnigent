@@ -689,6 +689,75 @@ async def test_managed_token_authenticates_as_record_owner(
     assert host.sandbox_id == "sb-tunnel-1"
 
 
+async def test_rotated_managed_token_is_fenced_before_online_transition(
+    host_app: tuple[FastAPI, HostRegistry, HostStore],
+) -> None:
+    """A token rotated after handshake cannot connect the replacement generation."""
+    app, registry, store = host_app
+    _register_managed(store, host_id=_HOST_ID, token="generation-one-token")
+
+    communicator = ApplicationCommunicator(
+        app,
+        _managed_scope(_TUNNEL_PATH, "generation-one-token"),
+    )
+    await communicator.send_input({"type": "websocket.connect"})
+    accepted = await communicator.receive_output(timeout=1.0)
+    assert accepted["type"] == "websocket.accept"
+
+    store.register_managed_host(
+        host_id=_HOST_ID,
+        name=f"managed-{_HOST_ID}",
+        user_id="alice@example.com",
+        token="generation-two-token",
+        provider="modal",
+        sandbox_id="sb-tunnel-2",
+        token_expires_at=now_epoch() + 3600,
+        expected_sandbox_id="sb-tunnel-1",
+    )
+    await communicator.send_input(
+        {
+            "type": "websocket.receive",
+            "text": encode_host_frame(
+                HostHelloFrame(
+                    version="0.1.0-test",
+                    frame_protocol_version=1,
+                    name=f"managed-{_HOST_ID}",
+                )
+            ),
+        }
+    )
+
+    closed = await communicator.receive_output(timeout=1.0)
+    assert closed["type"] == "websocket.close"
+    assert closed["code"] == 4004
+    assert registry.get(_HOST_ID) is None
+    host = store.get_host(_HOST_ID)
+    assert host is not None
+    assert host.status == "offline"
+    assert host.sandbox_id == "sb-tunnel-2"
+
+
+async def test_managed_token_rejects_different_authenticated_owner(db_uri: str) -> None:
+    """A launch capability cannot cross an independently authenticated owner."""
+    app, registry, store = _owned_app(db_uri, authed_user="bob@example.com")
+    _register_managed(store, host_id=_HOST_ID, token="alice-managed-token")
+
+    communicator = ApplicationCommunicator(
+        app,
+        _managed_scope(_TUNNEL_PATH, "alice-managed-token"),
+    )
+    await communicator.send_input({"type": "websocket.connect"})
+
+    closed = await communicator.receive_output(timeout=1.0)
+    assert closed["type"] == "websocket.close"
+    assert closed["code"] == 4004
+    assert registry.get(_HOST_ID) is None
+    host = store.get_host(_HOST_ID)
+    assert host is not None
+    assert host.user_id == "alice@example.com"
+    assert host.status == "offline"
+
+
 @pytest.mark.parametrize(
     ("record_host_id", "token", "presented_token", "expires_in_s"),
     [

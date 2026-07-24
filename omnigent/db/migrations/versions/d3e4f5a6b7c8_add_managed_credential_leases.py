@@ -40,7 +40,7 @@ def upgrade() -> None:
         sa.Column("repo_url", sa.String(length=2048), nullable=True),
         sa.Column("repo_branch", sa.String(length=256), nullable=True),
         sa.Column("repo_name", sa.String(length=256), nullable=True),
-        sa.Column("reference", sa.String(length=256), nullable=True),
+        sa.Column("reference", sa.Text(), nullable=True),
         # Random fencing identity only; never a provider credential or auth token.
         sa.Column("launch_owner_id", sa.String(length=64), nullable=False),
         sa.Column("owner_expires_at", sa.Integer(), nullable=False),
