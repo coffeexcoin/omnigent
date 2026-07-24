@@ -98,6 +98,14 @@ HOST_STATUS: dict[str, int] = {
     "offline": 2,
 }
 
+MANAGED_CREDENTIAL_LEASE_STATE: dict[str, int] = {
+    "pending": 1,
+    "active": 2,
+    "retiring": 3,
+    "recovering": 4,
+    "released": 5,
+}
+
 AGENT_KIND: dict[str, int] = {
     "template": 1,
     "session": 2,
@@ -288,6 +296,24 @@ def encode_host_status(name: str) -> int:
 def decode_host_status(code: int) -> str:
     """Decode a ``hosts.status`` int code to its name."""
     return _decode(HOST_STATUS, code, field="hosts.status")
+
+
+def encode_managed_credential_lease_state(name: str) -> int:
+    """Encode a managed credential lease state for SQL storage."""
+    return _encode(
+        MANAGED_CREDENTIAL_LEASE_STATE,
+        name,
+        field="managed_credential_leases.state",
+    )
+
+
+def decode_managed_credential_lease_state(code: int) -> str:
+    """Decode a managed credential lease state from SQL storage."""
+    return _decode(
+        MANAGED_CREDENTIAL_LEASE_STATE,
+        code,
+        field="managed_credential_leases.state",
+    )
 
 
 def encode_agent_kind(name: str) -> int:

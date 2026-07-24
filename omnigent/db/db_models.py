@@ -1295,6 +1295,83 @@ class SqlHost(OmnigentBase):
     )
 
 
+class SqlManagedCredentialLease(OmnigentBase):
+    """Durable, non-secret cleanup metadata for managed-host credentials.
+
+    Released rows remain as reference-free generation tombstones so generation
+    numbers never repeat for a durable host identity. There are deliberately no
+    foreign keys: cleanup metadata must survive deletion of its host or session.
+    """
+
+    __tablename__ = "managed_credential_leases"
+
+    workspace_id: Mapped[int] = mapped_column(
+        BigInteger,
+        primary_key=True,
+        nullable=False,
+        server_default="0",
+        default=current_workspace_id,
+    )
+    host_id: Mapped[str] = mapped_column(Uuid16(), primary_key=True)
+    generation: Mapped[int] = mapped_column(Integer, primary_key=True)
+    user_id: Mapped[str] = mapped_column(String(128), nullable=False)
+    host_name: Mapped[str] = mapped_column(String(64), nullable=False)
+    sandbox_provider: Mapped[str] = mapped_column(String(32), nullable=False)
+    sandbox_id: Mapped[str] = mapped_column(String(256), nullable=False)
+    session_id: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    repo_url: Mapped[str | None] = mapped_column(String(2048), nullable=True)
+    repo_branch: Mapped[str | None] = mapped_column(String(256), nullable=True)
+    repo_name: Mapped[str | None] = mapped_column(String(256), nullable=True)
+    reference: Mapped[str | None] = mapped_column(Text, nullable=True)
+    credential_cleanup_required: Mapped[bool] = mapped_column(
+        Boolean,
+        nullable=False,
+        server_default=true(),
+    )
+    # Random fencing identity only; this is not a provider credential or an
+    # authentication token and grants no access outside lifecycle CAS updates.
+    launch_owner_id: Mapped[str] = mapped_column(String(64), nullable=False)
+    owner_expires_at: Mapped[int] = mapped_column(Integer, nullable=False)
+    claim_owner: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    claim_expires_at: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    state: Mapped[int] = mapped_column(SmallInteger, nullable=False)
+    created_at: Mapped[int] = mapped_column(Integer, nullable=False)
+    updated_at: Mapped[int] = mapped_column(Integer, nullable=False)
+
+    __table_args__ = (
+        CheckConstraint(
+            "state IN (1, 2, 3, 4, 5)",
+            name="ck_managed_credential_leases_state",
+        ),
+        CheckConstraint(
+            "generation > 0",
+            name="ck_managed_credential_leases_generation_positive",
+        ),
+        CheckConstraint(
+            "(state IN (1, 2) AND claim_owner IS NULL AND claim_expires_at IS NULL) "
+            "OR (state IN (3, 4) AND claim_owner IS NOT NULL "
+            "AND claim_expires_at IS NOT NULL) "
+            "OR (state = 5 AND claim_owner IS NULL AND claim_expires_at IS NULL "
+            "AND reference IS NULL)",
+            name="ck_managed_credential_leases_lifecycle",
+        ),
+        Index(
+            "ix_managed_credential_leases_owner_recovery",
+            "workspace_id",
+            "state",
+            "owner_expires_at",
+            "host_id",
+        ),
+        Index(
+            "ix_managed_credential_leases_claim_recovery",
+            "workspace_id",
+            "state",
+            "claim_expires_at",
+            "host_id",
+        ),
+    )
+
+
 class SqlUserDailyCost(OmnigentBase):
     """
     SQLAlchemy model for the ``user_daily_cost`` table.

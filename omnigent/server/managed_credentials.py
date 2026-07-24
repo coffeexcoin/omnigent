@@ -28,20 +28,14 @@ Three types make up the contract:
   addon created out of band) plus lifecycle hooks.
 * :class:`ManagedCredentialHook` — the async resolver an addon implements.
 
-**Ownership and cleanup (read before implementing a hook).** The lease is
-acquired once, immediately before the in-sandbox host process starts, so the
-credentials are resolvable by the time the host authenticates. This layer owns
-exactly ONE cleanup obligation: if the launch it acquired the lease for FAILS
-(provision-adjacent error, host never comes online, bind race), it calls
-:meth:`ManagedCredentialLease.release` before tearing the sandbox down. The
-steady-state release of a lease whose launch SUCCEEDED — tied to sandbox
-teardown (``terminate_managed_host``) or superseded by a relaunch's new
-generation — is NOT yet wired here: a durable lease handle would have to be
-persisted on the host row and replayed at teardown, which is broader plumbing
-than this seam introduces. Until that lands, a hook whose credentials need
-teardown-time revocation must key its own bookkeeping off the launch identity
-(``host_id`` + generation) rather than relying on this layer to release the
-success-path lease. :meth:`release` must be idempotent and must never raise.
+**Ownership and cleanup (read before implementing a hook).** Before acquisition,
+Omnigent durably reserves a generation and passes it to the hook. Implementations
+must use the launch identity plus generation as a deterministic cleanup key so a
+restart can release credentials created before :meth:`acquire` returned. Only
+the non-secret reference is persisted after acquisition. A failed launch
+releases the live lease object; successful and interrupted leases are released
+through :meth:`ManagedCredentialHook.release` on teardown, relaunch, or restart
+recovery. Both release methods must be idempotent and must never raise.
 """
 
 from __future__ import annotations
@@ -93,6 +87,26 @@ class ManagedLaunchContext:
     repo_name: str | None = None
 
 
+@dataclass(frozen=True, slots=True)
+class ManagedCredentialReleaseContext:
+    """Durable identity available to cleanup after a process crash.
+
+    This mirrors every non-secret coordinate from :class:`ManagedLaunchContext`
+    and adds the concrete sandbox identity so a hook can deterministically
+    reconstruct the exact provider resource after the acquiring process exits.
+    """
+
+    owner: str
+    host_id: str
+    host_name: str
+    sandbox_provider: str
+    sandbox_id: str
+    session_id: str | None = None
+    repo_url: str | None = None
+    repo_branch: str | None = None
+    repo_name: str | None = None
+
+
 class ManagedCredentialLease(ABC):
     """
     A resolved per-launch credential lease returned by a hook.
@@ -111,9 +125,8 @@ class ManagedCredentialLease(ABC):
     (non-secret) reference, so a subclass that adds private credential fields
     still reprs safely by default.
 
-    See the module docstring for the ownership/cleanup contract: this layer
-    calls :meth:`release` only on the FAILURE of the launch the lease was
-    acquired for.
+    This live object's release method handles failures in the process that
+    acquired it; durable cleanup uses :meth:`ManagedCredentialHook.release`.
     """
 
     @property
@@ -134,9 +147,8 @@ class ManagedCredentialLease(ABC):
         """
         Release / revoke this lease.
 
-        Called by the managed-launch layer only when the launch this lease was
-        acquired for fails, before the sandbox is torn down (see the module
-        docstring for why success-path release is not yet this layer's job).
+        Called when the launch this live object belongs to fails. Teardown after
+        the acquiring process exits is reconstructed through the hook instead.
 
         MUST be idempotent — a second call, or a call on a lease whose
         credentials were never fully provisioned, is a no-op — and MUST NOT
@@ -146,8 +158,8 @@ class ManagedCredentialLease(ABC):
         """
 
     def __repr__(self) -> str:
-        """Redacted repr: class name + non-secret reference only."""
-        return f"{type(self).__name__}(reference={self.reference!r})"
+        """Return a representation that never resolves or exposes provider state."""
+        return f"{type(self).__name__}(reference=[REDACTED], secret=[REDACTED])"
 
 
 class ManagedCredentialHook(ABC):
@@ -167,15 +179,26 @@ class ManagedCredentialHook(ABC):
     """
 
     @abstractmethod
-    async def acquire(self, context: ManagedLaunchContext) -> ManagedCredentialLease:
-        """
-        Resolve credentials for *context* and return a lease.
+    async def acquire(
+        self,
+        context: ManagedLaunchContext,
+        generation: int,
+    ) -> ManagedCredentialLease:
+        """Resolve credentials for one launch and return their lease.
 
-        Called exactly once per managed-host launch attempt, before the host
-        process starts, so the returned lease's credentials are in place by the
-        time the host authenticates. Async so an implementation may perform the
-        network I/O a real resolver needs (mint a scoped token, create a
-        provider Secret) without blocking the launch's event loop.
+        Called exactly once per managed-host launch attempt, after *generation*
+        is durably reserved and before the host process starts. Implementations
+        must key provider resource identity only from ``context.owner``,
+        ``context.host_id``, and *generation*. Repository coordinates may select
+        credentials but must not affect resource identity. This lets
+        :meth:`release` clean up even if the process dies while this method is
+        creating a scoped token or provider Secret, before a reference can be
+        persisted.
+
+        Implementations must honor task cancellation. The server enforces its
+        deadline without waiting for a cancellation-resistant implementation,
+        runs deterministic release from the durable launch identity, and also
+        releases any lease the late task eventually returns.
 
         Raising aborts the launch: the orchestration treats a failed acquire
         like any other post-provision failure — it tears the sandbox down and
@@ -184,9 +207,27 @@ class ManagedCredentialHook(ABC):
 
         :param context: The immutable identity of the launch to resolve
             credentials for.
+        :param generation: Durable launch generation reserved before this call.
         :returns: The acquired lease (its
             :attr:`~ManagedCredentialLease.reference` exposed to launcher
             startup).
         :raises Exception: When credentials cannot be resolved; the launch is
             aborted and the sandbox torn down.
+        """
+        ...
+
+    async def release(  # noqa: B027 — intentional concrete no-op
+        self,
+        context: ManagedCredentialReleaseContext,
+        generation: int,
+        reference: str | None,
+    ) -> None:
+        """Release a persisted lease without its original in-memory object.
+
+        Called during successful sandbox teardown, before a relaunch supersedes
+        an old generation, and by restart recovery. ``reference`` may be ``None``
+        after a crash during :meth:`acquire`; implementations must then derive
+        the provider resource from ``context.owner``, ``context.host_id``, and
+        *generation*. Implementations must be idempotent and never raise. The
+        default is a no-op for credentials needing no explicit cleanup.
         """
