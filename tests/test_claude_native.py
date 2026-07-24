@@ -1993,6 +1993,51 @@ async def test_ensure_local_claude_resume_transcript_uses_workspace_dir(
 
 
 @pytest.mark.asyncio
+async def test_ensure_local_claude_resume_transcript_uses_actor_config_dir(
+    tmp_path: Path,
+) -> None:
+    """A takeover rebuilds the canonical transcript in the new actor home."""
+
+    workspace = Path("/work/some-repo")
+    actor_config_dir = tmp_path / "alice-claude"
+
+    def handler(_request: httpx.Request) -> httpx.Response:
+        return httpx.Response(
+            200,
+            json={
+                "data": [
+                    {
+                        "type": "message",
+                        "role": "user",
+                        "content": [{"type": "input_text", "text": "canonical history"}],
+                    }
+                ],
+                "has_more": False,
+            },
+        )
+
+    transport = httpx.MockTransport(handler)
+    async with httpx.AsyncClient(transport=transport, base_url="https://example.com") as client:
+        written = await claude_native._ensure_local_claude_resume_transcript(
+            client,
+            session_id="conv_shared",
+            external_session_id="sid123",
+            workspace=workspace,
+            config_dir=actor_config_dir,
+        )
+
+    expected = (
+        actor_config_dir
+        / "projects"
+        / claude_native._sanitize_claude_project_name(str(workspace))
+        / "sid123.jsonl"
+    )
+    assert written == expected
+    assert expected.is_file()
+    assert "canonical history" in expected.read_text(encoding="utf-8")
+
+
+@pytest.mark.asyncio
 async def test_ensure_local_claude_resume_transcript_returns_none_when_no_records(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,

@@ -72,6 +72,9 @@ class _TrackingTerminalRegistry:
     async def shutdown(self) -> None:
         self.shutdown_called = True
 
+    def list_for_conversation(self, _conversation_id: str) -> list[Any]:
+        return []
+
 
 class _TrackingMcpManager:
     """RunnerMcpManager stand-in that records shutdown calls."""
@@ -1530,7 +1533,7 @@ async def test_runner_shutdown_closes_terminal_registry(
 @pytest.mark.asyncio
 @pytest.mark.parametrize(
     "failing_step",
-    ["bridge", "provider", "pane", "process", "terminal", "mcp", "client"],
+    ["bridge", "provider", "model", "pane", "process", "terminal", "mcp", "client"],
 )
 async def test_runner_shutdown_attempts_every_resource_after_failure(failing_step: str) -> None:
     """One cleanup failure cannot skip credential revocation or later cleanup."""
@@ -1560,6 +1563,7 @@ async def test_runner_shutdown_attempts_every_resource_after_failure(failing_ste
         await entry_mod._shutdown_runner_resources(
             credential_bridge=_Step("bridge"),
             credential_provider=_Step("provider"),
+            model_credential_provider=_Step("model"),
             pane_reaper=_Step("pane"),
             process_manager=_Step("process"),
             terminal_registry=_Step("terminal"),
@@ -1567,7 +1571,16 @@ async def test_runner_shutdown_attempts_every_resource_after_failure(failing_ste
             server_client=_Step("client"),
         )
 
-    assert events == ["bridge", "provider", "pane", "process", "terminal", "mcp", "client"]
+    assert events == [
+        "bridge",
+        "provider",
+        "model",
+        "pane",
+        "process",
+        "terminal",
+        "mcp",
+        "client",
+    ]
 
 
 def test_runner_workspace_from_env_returns_none_without_value(

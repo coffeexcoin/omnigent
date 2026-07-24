@@ -12,7 +12,7 @@ import shlex
 import sys
 import tempfile
 import uuid
-from collections.abc import AsyncIterator
+from collections.abc import AsyncIterator, Mapping
 from dataclasses import dataclass
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
@@ -602,7 +602,7 @@ class CodexNativeAppServer:
                 self.socket_path.unlink()
         _populate_codex_home_config(
             self.codex_home,
-            _codex_home_config_source_from_env(),
+            _codex_home_config_source_from_env(self.env),
         )
         # Write the MCP server config into config.toml so the app-server
         # discovers it at config load. The -c overrides may not be honored
@@ -1151,6 +1151,7 @@ def build_codex_native_server(
     extra_config_overrides: list[str] | None = None,
     developer_instructions: str | None = None,
     bypass_sandbox: bool = False,
+    model_credential_env: Mapping[str, str] | None = None,
 ) -> CodexNativeAppServer:
     """
     Build a configured native Codex app-server process wrapper.
@@ -1198,6 +1199,7 @@ def build_codex_native_server(
             "nvm-managed bin dir), set OMNIGENT_CODEX_PATH=/path/to/codex."
         )
     env = _clean_codex_env()
+    env.update(model_credential_env or {})
     config_overrides: list[str] = []
     if profile is not None:
         # Use the profile's own host so the gateway base URL matches the token

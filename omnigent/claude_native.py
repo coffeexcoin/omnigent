@@ -1306,7 +1306,7 @@ def _find_claude_transcript(
     return matches[0]
 
 
-def _claude_project_dir_for_cwd(cwd: Path) -> Path:
+def _claude_project_dir_for_cwd(cwd: Path, *, config_dir: Path | None = None) -> Path:
     """
     Return Claude's project transcript directory for *cwd*.
 
@@ -1317,7 +1317,8 @@ def _claude_project_dir_for_cwd(cwd: Path) -> Path:
     :param cwd: Absolute cwd, e.g. ``Path("/home/me/repo")``.
     :returns: Claude project transcript directory.
     """
-    return _CLAUDE_PROJECTS_DIR / _sanitize_claude_project_name(str(cwd))
+    projects_dir = (config_dir / "projects") if config_dir is not None else _CLAUDE_PROJECTS_DIR
+    return projects_dir / _sanitize_claude_project_name(str(cwd))
 
 
 def _sanitize_claude_project_name(path: str) -> str:
@@ -3367,6 +3368,7 @@ async def _ensure_local_claude_resume_transcript(
     session_id: str,
     external_session_id: str,
     workspace: Path,
+    config_dir: Path | None = None,
 ) -> Path | None:
     """
     Refresh Claude Code's local JSONL transcript for cold resume.
@@ -3402,7 +3404,7 @@ async def _ensure_local_claude_resume_transcript(
     if not _CLAUDE_SESSION_ID_RE.fullmatch(external_session_id):
         return None
     current = workspace
-    target_dir = _claude_project_dir_for_cwd(current)
+    target_dir = _claude_project_dir_for_cwd(current, config_dir=config_dir)
     target = target_dir / f"{external_session_id}.jsonl"
 
     items = await _fetch_all_session_items_for_claude_resume(client, session_id)

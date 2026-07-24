@@ -2181,6 +2181,48 @@ def test_populate_codex_skills_from_bundle_none_leaves_no_dir(tmp_path: Path) ->
 # ---------------------------------------------------------------------------
 
 
+def test_codex_home_config_source_prefers_actor_environment(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from omnigent.inner.codex_executor import _codex_home_config_source_from_env
+
+    inherited = tmp_path / "inherited"
+    actor_home = tmp_path / "actor"
+    monkeypatch.setenv("CODEX_HOME", str(inherited))
+
+    assert _codex_home_config_source_from_env({"CODEX_HOME": str(actor_home)}) == actor_home
+
+
+def test_rebind_codex_home_config_rotates_actor_without_removing_rollout(
+    tmp_path: Path,
+) -> None:
+    from omnigent.inner.codex_executor import _rebind_codex_home_config
+
+    alice = tmp_path / "alice"
+    bob = tmp_path / "bob"
+    target = tmp_path / "session"
+    for directory in (alice, bob, target):
+        directory.mkdir()
+    (alice / "auth.json").write_text('{"account":"alice"}')
+    (alice / "config.toml").write_text('model = "alice-model"')
+    (bob / "auth.json").write_text('{"account":"bob"}')
+    (bob / "config.toml").write_text('model = "bob-model"')
+    rollout = target / "sessions" / "rollout.jsonl"
+    rollout.parent.mkdir()
+    rollout.write_text('{"type":"message"}\n')
+
+    _rebind_codex_home_config(target, alice)
+    assert (target / "auth.json").read_text() == '{"account":"alice"}'
+
+    _rebind_codex_home_config(target, bob)
+
+    assert (target / "auth.json").is_symlink()
+    assert (target / "auth.json").resolve() == bob / "auth.json"
+    assert (target / "config.toml").read_text() == 'model = "bob-model"'
+    assert rollout.read_text() == '{"type":"message"}\n'
+
+
 def test_populate_codex_home_config_symlinks_auth_and_config(tmp_path: Path) -> None:
     """``auth.json`` is symlinked; ``config.toml`` is copied (not symlinked).
 
