@@ -486,6 +486,19 @@ HARNESS_CREDENTIAL_ENV_VARS: frozenset[str] = frozenset(
     for name in env_names_with_omnigent_prefix(canonical)
 )
 
+# Managed-launch GitHub broker coordinates are consumed and removed by the
+# runner before it constructs a harness process manager. They must cross the
+# host→runner allowlist, but unlike harness credentials they are never forwarded
+# onward to agent processes.
+MANAGED_GITHUB_BROKER_ENV_VARS: frozenset[str] = frozenset(
+    {
+        "OMNIGENT_GITHUB_CREDENTIAL_BROKER_URL",
+        "OMNIGENT_GITHUB_CREDENTIAL_BROKER_CAPABILITY",
+        "OMNIGENT_GITHUB_CREDENTIAL_OWNER",
+        "OMNIGENT_GITHUB_CREDENTIAL_SESSION_ID",
+    }
+)
+
 # Comma-separated EXTRA env var names to forward host→runner, beyond
 # HARNESS_CREDENTIAL_ENV_VARS — for provider wiring the defaults don't
 # cover (custom gateway vars, `providers:`-config `env:` refs, exotic
@@ -569,7 +582,7 @@ def _build_runner_env(
         for name in base_env.get(RUNNER_ENV_PASSTHROUGH_ENV_VAR, "").split(",")
         if name.strip()
     }
-    forwarded = HARNESS_CREDENTIAL_ENV_VARS | extra_names
+    forwarded = HARNESS_CREDENTIAL_ENV_VARS | MANAGED_GITHUB_BROKER_ENV_VARS | extra_names
     env = {
         key: value
         for key, value in base_env.items()

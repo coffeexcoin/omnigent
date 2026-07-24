@@ -1608,6 +1608,35 @@ def test_build_runner_env_forwards_harness_credentials_and_endpoints() -> None:
     assert "MY_UNRELATED_SECRET" not in env
 
 
+def test_build_runner_env_forwards_managed_github_broker_only_to_runner() -> None:
+    """Managed launch coordinates cross the host allowlist for runner consumption."""
+    from omnigent.host.connect import MANAGED_GITHUB_BROKER_ENV_VARS
+    from omnigent.runner.github_credentials import (
+        GITHUB_BROKER_CAPABILITY_ENV,
+        GITHUB_BROKER_OWNER_ENV,
+        GITHUB_BROKER_SESSION_ENV,
+        GITHUB_BROKER_URL_ENV,
+    )
+
+    broker_environment = {
+        GITHUB_BROKER_URL_ENV: "https://credentials.example.test/v1/github/grants",
+        GITHUB_BROKER_CAPABILITY_ENV: "launch-capability",
+        GITHUB_BROKER_OWNER_ENV: "owner@example.com",
+        GITHUB_BROKER_SESSION_ENV: "conv_owner",
+    }
+    env = _build_runner_env(
+        {"PATH": "/usr/bin", **broker_environment},
+        server_url="http://server",
+        runner_id="runner_abc",
+        binding_token="tok",
+        workspace="/ws",
+        parent_pid=42,
+    )
+
+    assert set(broker_environment) == MANAGED_GITHUB_BROKER_ENV_VARS
+    assert {name: env[name] for name in broker_environment} == broker_environment
+
+
 def test_build_runner_env_forwards_omnigent_prefixed_harness_credentials() -> None:
     """Prefixed harness credential aliases forward without creating raw names."""
     from omnigent.host.connect import HARNESS_CREDENTIAL_ENV_VARS

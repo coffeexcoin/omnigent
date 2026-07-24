@@ -1400,10 +1400,12 @@ def test_install_crash_logging_is_idempotent() -> None:
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("startup_failure", [False, True])
 async def test_runner_shutdown_closes_terminal_registry(
     monkeypatch: pytest.MonkeyPatch,
+    startup_failure: bool,
 ) -> None:
-    """The --server local runner shuts down terminal-owned resources.
+    """The --server runner cleans up after normal or failed startup.
 
     ``examples/databricks_coding_agent.yaml`` exposes terminal tools,
     and in ``omnigent run --server`` mode those terminals are owned
@@ -1419,6 +1421,19 @@ async def test_runner_shutdown_closes_terminal_registry(
     async_clients: list[_TrackingAsyncClient] = []
     sync_clients: list[_TrackingSyncClient] = []
 
+    class _FakeGitHubProvider:
+        def __init__(self) -> None:
+            self.closed = False
+
+        async def issue(self, context: Any, request: Any) -> Any:
+            del context, request
+            raise AssertionError("provider should not be used during runner startup")
+
+        async def aclose(self) -> None:
+            self.closed = True
+
+    github_provider = _FakeGitHubProvider()
+
     class _FakeProcessManager:
         def __init__(self) -> None:
             self.started = False
@@ -1427,6 +1442,8 @@ async def test_runner_shutdown_closes_terminal_registry(
 
         async def start(self) -> None:
             self.started = True
+            if startup_failure:
+                raise RuntimeError("process manager startup failed")
 
         async def shutdown(self) -> None:
             self.shutdown_called = True
@@ -1471,17 +1488,28 @@ async def test_runner_shutdown_closes_terminal_registry(
     monkeypatch.setattr(entry_mod.httpx, "Client", _sync_client_factory)
     monkeypatch.setattr(entry_mod, "_make_auth_token_factory", lambda: None)
     monkeypatch.setattr(
+        "omnigent.runner.github_credentials.consume_github_credential_provider_from_environment",
+        lambda: github_provider,
+    )
+    monkeypatch.setattr(
         "omnigent.runner.identity.get_stable_runner_id",
         lambda: "runner-test-id",
     )
 
     app = entry_mod.create_app()
     # starlette 1.x removed Router.startup/shutdown; drive the lifespan instead.
-    async with app.router.lifespan_context(app):
-        pass
+    if startup_failure:
+        with pytest.raises(RuntimeError, match="process manager startup failed"):
+            async with app.router.lifespan_context(app):
+                pass
+    else:
+        async with app.router.lifespan_context(app):
+            pass
 
     assert process_managers and process_managers[0].shutdown_called
     assert terminal_registries and terminal_registries[0].shutdown_called
+    assert app.state.credential_broker is not None
+    assert github_provider.closed
     assert terminal_registries[0].conversation_link_base_url == "http://runner.test"
     # In Omnigent mode (P1) the entry point passes mcp_manager=None; MCP calls are
     # routed per-session through ProxyMcpManager (runner/proxy_mcp_manager.py)
@@ -1497,6 +1525,49 @@ async def test_runner_shutdown_closes_terminal_registry(
     # polling was deleted with that path. If a future change
     # reintroduces a sync client, the factory above will catch it
     # and the equivalent assertion can return.
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "failing_step",
+    ["bridge", "provider", "pane", "process", "terminal", "mcp", "client"],
+)
+async def test_runner_shutdown_attempts_every_resource_after_failure(failing_step: str) -> None:
+    """One cleanup failure cannot skip credential revocation or later cleanup."""
+    import omnigent.runner._entry as entry_mod
+
+    events: list[str] = []
+
+    class _Step:
+        def __init__(self, name: str) -> None:
+            self.name = name
+
+        async def _run(self) -> None:
+            events.append(self.name)
+            if self.name == failing_step:
+                raise RuntimeError(f"{self.name} cleanup failed")
+
+        async def close(self) -> None:
+            await self._run()
+
+        async def aclose(self) -> None:
+            await self._run()
+
+        async def shutdown(self) -> None:
+            await self._run()
+
+    with pytest.raises(RuntimeError, match=f"{failing_step} cleanup failed"):
+        await entry_mod._shutdown_runner_resources(
+            credential_bridge=_Step("bridge"),
+            credential_provider=_Step("provider"),
+            pane_reaper=_Step("pane"),
+            process_manager=_Step("process"),
+            terminal_registry=_Step("terminal"),
+            mcp_manager=_Step("mcp"),
+            server_client=_Step("client"),
+        )
+
+    assert events == ["bridge", "provider", "pane", "process", "terminal", "mcp", "client"]
 
 
 def test_runner_workspace_from_env_returns_none_without_value(

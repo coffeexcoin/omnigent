@@ -1527,6 +1527,11 @@ def create_app(
             from omnigent.server.routes.sessions import cancel_managed_launch_tasks
 
             await cancel_managed_launch_tasks()
+            if sandbox_config is not None and sandbox_config.credential_hook is not None:
+                try:
+                    await sandbox_config.credential_hook.aclose()
+                except Exception:  # noqa: BLE001 - provider errors may contain secrets
+                    _logger.warning("Managed credential hook close failed")
             await background_title_coordinator.shutdown()
             _uninstall_subagent_block_notifier()
             set_resource_registry(None)

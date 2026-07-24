@@ -5,9 +5,11 @@ from __future__ import annotations
 import asyncio
 import dataclasses
 import datetime
+import json
 import subprocess
 import sys
 import threading
+import time
 from collections.abc import Callable
 from pathlib import Path
 from typing import Any, ClassVar
@@ -16,7 +18,7 @@ import click
 import pytest
 import sqlalchemy as sa
 from fastapi import FastAPI, HTTPException
-from httpx import ASGITransport, AsyncClient
+from httpx import ASGITransport, AsyncClient, MockTransport, Request, Response
 
 from omnigent.db.utils import now_epoch
 from omnigent.onboarding.sandboxes.base import render_host_config_write_command
@@ -24,6 +26,10 @@ from omnigent.onboarding.sandboxes.e2b import managed_token_ttl_s as e2b_managed
 from omnigent.runtime import _globals
 from omnigent.runtime.agent_cache import AgentCache
 from omnigent.server.app import create_app
+from omnigent.server.github_credentials import (
+    BrokeredGitHubCredentialHook,
+    BrokeredGitHubCredentialHookConfig,
+)
 from omnigent.server.managed_credentials import (
     ManagedCredentialHook,
     ManagedCredentialLease,
@@ -572,6 +578,60 @@ def test_parse_kubernetes_without_section_defaults(monkeypatch: pytest.MonkeyPat
     assert fake.secret_name is None
     assert fake.in_cluster is None
     assert fake.resources is None
+
+
+def test_parse_kubernetes_wires_concrete_github_credential_hook() -> None:
+    cfg = parse_sandbox_config(
+        {
+            "provider": "kubernetes",
+            "server_url": "https://s.example.com",
+            "github_credentials": {
+                "endpoint": "https://credentials.example.com/v1/managed-github-leases",
+                "max_lease_ttl_s": 1800,
+                "acquisition_timeout_s": 7,
+            },
+        }
+    )
+
+    assert cfg is not None
+    assert isinstance(cfg.credential_hook, BrokeredGitHubCredentialHook)
+    assert cfg.credential_acquisition_timeout_s == 7
+
+
+@pytest.mark.parametrize(
+    ("provider", "github_credentials", "message"),
+    [
+        ("modal", {"endpoint": "https://credentials.example.com"}, "only supported"),
+        ("kubernetes", "https://credentials.example.com", "must be a mapping"),
+        ("kubernetes", {}, "endpoint"),
+        (
+            "kubernetes",
+            {"endpoint": "https://credentials.example.com", "unknown": True},
+            "unknown key",
+        ),
+        (
+            "kubernetes",
+            {
+                "endpoint": "https://credentials.example.com",
+                "acquisition_timeout_s": 0,
+            },
+            "positive",
+        ),
+    ],
+)
+def test_parse_github_credential_hook_rejects_invalid_config(
+    provider: str,
+    github_credentials: object,
+    message: str,
+) -> None:
+    with pytest.raises(ValueError, match=message):
+        parse_sandbox_config(
+            {
+                "provider": provider,
+                "server_url": "https://s.example.com",
+                "github_credentials": github_credentials,
+            }
+        )
 
 
 def test_parse_host_config_threads_verbatim_without_resolving_secrets(
@@ -2732,6 +2792,61 @@ async def test_provider_secret_and_durable_lease_share_one_lifecycle(db_uri: str
     assert restarted_store.list_credential_leases(result.host_id) == []
     assert restarted_store.get_host(result.host_id) is None
     assert len(restarted_hook.release_calls) == 1
+
+
+async def test_concrete_github_hook_flows_through_launch_and_restart_teardown(
+    db_uri: str,
+) -> None:
+    """The concrete owner-scoped producer feeds launcher state and durable cleanup."""
+    requests: list[tuple[str, dict[str, object]]] = []
+
+    def handler(request: Request) -> Response:
+        payload = json.loads(request.content)
+        requests.append((request.method, payload))
+        if request.method == "POST":
+            return Response(
+                201,
+                json={
+                    "reference": "omnigent-github-concrete-1",
+                    "expires_at": time.time() + 300,
+                },
+            )
+        return Response(204)
+
+    launch_store = HostStore(db_uri)
+    launcher = _CredentialRefRecordingLauncher(on_host_start=_online_register(launch_store))
+    hook_config = BrokeredGitHubCredentialHookConfig(
+        endpoint="https://credentials.example.test/v1/managed-github-leases",
+        max_lease_ttl_s=3600,
+    )
+    async with AsyncClient(transport=MockTransport(handler)) as client:
+        launch_hook = BrokeredGitHubCredentialHook(hook_config, client=client)
+        result = await launch_managed_host(
+            config=_hook_config(launcher, launch_hook),
+            owner=_OWNER,
+            host_store=launch_store,
+            session_id="conv_concrete",
+        )
+
+        restarted_store = HostStore(db_uri)
+        host = restarted_store.get_host(result.host_id)
+        assert host is not None
+        await terminate_managed_host(
+            host,
+            restarted_store,
+            _hook_config(
+                launcher,
+                BrokeredGitHubCredentialHook(hook_config, client=client),
+            ),
+        )
+
+    assert launcher.credential_references == ["omnigent-github-concrete-1"]
+    assert [method for method, _ in requests] == ["POST", "DELETE"]
+    assert requests[0][1]["owner"] == _OWNER
+    assert requests[0][1]["session_id"] == "conv_concrete"
+    assert requests[0][1]["generation"] == 1
+    assert requests[1][1]["reference"] == "omnigent-github-concrete-1"
+    assert restarted_store.list_credential_leases(result.host_id) == []
 
 
 async def test_terminate_releases_successful_lease_after_process_restart(db_uri: str) -> None:
