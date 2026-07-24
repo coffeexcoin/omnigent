@@ -2309,9 +2309,9 @@ async def _release_lease_best_effort(lease: ManagedCredentialLease | None) -> bo
     try:
         await asyncio.wait_for(lease.release(), timeout=_CREDENTIAL_CLEANUP_TIMEOUT_S)
     except Exception:  # noqa: BLE001 — cleanup boundary: a hook's release must
-        # never mask the launch failure being handled. The lease repr is
-        # redacted (no secrets), so it is safe to log.
-        _logger.warning("Failed to release managed credential lease %r", lease, exc_info=True)
+        # never mask the launch failure being handled. Do not attach the hook's
+        # exception: a broken implementation may include credential material.
+        _logger.warning("Failed to release managed credential lease %r", lease)
         return False
     return True
 
@@ -2396,7 +2396,6 @@ async def _release_stored_credential_leases(
                     "Managed credential generation %s release failed for host %s",
                     record.generation,
                     record.host_id,
-                    exc_info=True,
                 )
                 all_released = False
                 continue

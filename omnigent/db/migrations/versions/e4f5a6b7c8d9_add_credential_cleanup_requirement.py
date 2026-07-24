@@ -33,4 +33,5 @@ def upgrade() -> None:
 
 def downgrade() -> None:
     """Remove the credential cleanup discriminator."""
-    op.drop_column("managed_credential_leases", "credential_cleanup_required")
+    with op.batch_alter_table("managed_credential_leases") as batch_op:
+        batch_op.drop_column("credential_cleanup_required")

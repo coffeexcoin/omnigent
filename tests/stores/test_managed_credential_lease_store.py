@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import threading
 
 import pytest
 import sqlalchemy as sa
@@ -211,6 +212,38 @@ def test_expired_launch_owner_cannot_claim_pending_before_recovery(
     ]
 
 
+async def test_competing_recovery_claimers_have_one_winner(db_uri: str) -> None:
+    """Concurrent replicas cannot both acquire cleanup authority."""
+    record = _record(HostStore(db_uri))
+    _expire_owner(db_uri, record.generation)
+    barrier = threading.Barrier(2)
+
+    def claim(owner: str) -> list[CredentialLeaseRecord]:
+        barrier.wait()
+        return HostStore(db_uri).claim_recoverable_credential_leases(
+            claim_owner=owner,
+            stale_before=now_epoch(),
+            claim_expires_at=now_epoch() + 120,
+        )
+
+    first, second = await asyncio.gather(
+        asyncio.to_thread(claim, "recovery-1"),
+        asyncio.to_thread(claim, "recovery-2"),
+    )
+
+    winners = first + second
+    assert len(winners) == 1
+    assert winners[0].generation == record.generation
+    assert winners[0].claim_owner in {"recovery-1", "recovery-2"}
+    persisted = HostStore(db_uri).list_credential_leases(
+        _HOST_ID,
+        include_released=True,
+    )
+    assert len(persisted) == 1
+    assert persisted[0].state == "recovering"
+    assert persisted[0].claim_owner == winners[0].claim_owner
+
+
 def test_non_future_claim_expiries_do_not_authorize_cleanup(db_uri: str) -> None:
     """Claim entry points reject work that would be stale before it is returned."""
     store = HostStore(db_uri)
@@ -383,6 +416,12 @@ def test_reference_activation_and_release_are_cas_fenced(db_uri: str) -> None:
     _register(store, "sb-generation-1")
     record = _record(store)
 
+    assert not store.release_credential_lease(
+        _HOST_ID,
+        record.generation,
+        claim_owner="cleanup-1",
+    )
+
     assert not store.set_credential_lease_reference(
         _HOST_ID, record.generation, "secret-ref", "wrong-owner"
     )
@@ -455,7 +494,17 @@ def test_reference_activation_and_release_are_cas_fenced(db_uri: str) -> None:
         record.generation,
         claim_owner="cleanup-1",
     )
+    assert not store.release_credential_lease(
+        _HOST_ID,
+        record.generation + 1,
+        claim_owner="cleanup-2",
+    )
     assert store.release_credential_lease(
+        _HOST_ID,
+        record.generation,
+        claim_owner="cleanup-2",
+    )
+    assert not store.release_credential_lease(
         _HOST_ID,
         record.generation,
         claim_owner="cleanup-2",

@@ -2603,8 +2603,11 @@ async def test_terminate_releases_successful_lease_after_process_restart(db_uri:
 
 async def test_failed_teardown_release_remains_recoverable_after_host_deletion(
     db_uri: str,
+    caplog: pytest.LogCaptureFixture,
 ) -> None:
-    """Cleanup failures retain the durable reference for a later boot retry."""
+    """Cleanup failures stay retryable without persisting or logging hook secrets."""
+
+    secret = "provider-error-secret-value"
 
     class _FailingReleaseHook(_FakeCredentialHook):
         async def release(
@@ -2613,7 +2616,7 @@ async def test_failed_teardown_release_remains_recoverable_after_host_deletion(
             generation: int,
             reference: str | None,
         ) -> None:
-            raise RuntimeError("temporary credential provider outage")
+            raise RuntimeError(f"temporary credential provider outage: {secret}")
 
     launch_store = HostStore(db_uri)
     launcher = FakeSandboxLauncher(on_host_start=_online_register(launch_store))
@@ -2632,7 +2635,13 @@ async def test_failed_teardown_release_remains_recoverable_after_host_deletion(
     )
 
     assert launch_store.get_host(result.host_id) is None
-    assert len(launch_store.list_credential_leases(result.host_id)) == 1
+    retryable = launch_store.list_credential_leases(result.host_id)
+    assert len(retryable) == 1
+    assert retryable[0].state == "retiring"
+    assert retryable[0].claim_owner is not None
+    assert retryable[0].claim_expires_at is not None
+    assert secret not in repr(retryable[0])
+    assert secret not in caplog.text
 
     engine = sa.create_engine(db_uri)
     try:
@@ -2762,7 +2771,8 @@ async def test_real_app_lifespan_recovers_crashed_launch(
 
     async with app.router.lifespan_context(app):
         for _ in range(100):
-            if not provider_resources:
+            leases = await asyncio.to_thread(crashed_store.list_credential_leases, host_id)
+            if not provider_resources and not leases:
                 break
             await asyncio.sleep(0.01)
 
@@ -2775,6 +2785,112 @@ async def test_real_app_lifespan_recovers_crashed_launch(
     assert release_context.repo_url == context.repo_url
     assert release_context.repo_branch == context.repo_branch
     assert release_context.repo_name == context.repo_name
+
+
+async def test_lifespan_stays_available_when_credential_release_blocks(
+    db_uri: str,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Startup and shutdown stay bounded while recovery remains durably retryable."""
+
+    class _BlockingReleaseHook(_FakeProviderCredentialHook):
+        def __init__(self, resources: set[str]) -> None:
+            super().__init__(resources)
+            self.entered = asyncio.Event()
+            self.release_gate = asyncio.Event()
+
+        async def release(
+            self,
+            context: ManagedCredentialReleaseContext,
+            generation: int,
+            reference: str | None,
+        ) -> None:
+            self.entered.set()
+            await self.release_gate.wait()
+            await super().release(context, generation, reference)
+
+    store = HostStore(db_uri)
+    host_id = "f2e3d4c5b6a7488990abcdef12345678"
+    store.register_managed_host(
+        host_id=host_id,
+        name="managed-blocked-recovery",
+        user_id=_OWNER,
+        token="ephemeral-launch-token",
+        provider="modal",
+        sandbox_id="sb-blocked-recovery",
+        token_expires_at=now_epoch() + 3600,
+    )
+    context = ManagedLaunchContext(
+        owner=_OWNER,
+        host_id=host_id,
+        host_name="managed-blocked-recovery",
+    )
+    pending = store.record_credential_lease(
+        host_id=host_id,
+        user_id=context.owner,
+        host_name=context.host_name,
+        sandbox_provider="modal",
+        sandbox_id="sb-blocked-recovery",
+        session_id=None,
+        repo_url=None,
+        repo_branch=None,
+        repo_name=None,
+        reference=None,
+        owner_token="dead-process-owner",
+    )
+    engine = sa.create_engine(db_uri)
+    try:
+        with engine.begin() as connection:
+            connection.execute(
+                sa.text(
+                    "UPDATE managed_credential_leases SET owner_expires_at = 0, updated_at = 0"
+                )
+            )
+
+        resources = {_FakeProviderCredentialHook.resource_name(context, pending.generation)}
+        hook = _BlockingReleaseHook(resources)
+        launcher = FakeSandboxLauncher()
+        config = _hook_config(launcher, hook)
+        app = _capability_probe_app(db_uri, tmp_path, config)
+        monkeypatch.setattr(_globals, "_terminal_registry", TerminalRegistry())
+
+        async def probe_startup() -> None:
+            async with app.router.lifespan_context(app):
+                await asyncio.wait_for(hook.entered.wait(), timeout=0.5)
+                assert resources
+                async with AsyncClient(
+                    transport=ASGITransport(app=app),
+                    base_url="http://test",
+                ) as client:
+                    response = await client.get("/v1/info")
+                assert response.status_code == 200, response.text
+
+        await asyncio.wait_for(probe_startup(), timeout=1)
+
+        retryable = store.list_credential_leases(host_id)
+        assert [(row.state, row.claim_owner is not None) for row in retryable] == [
+            ("recovering", True)
+        ]
+        assert launcher.terminated == ["sb-blocked-recovery"]
+
+        with engine.begin() as connection:
+            connection.execute(
+                sa.text("UPDATE managed_credential_leases SET claim_expires_at = 0")
+            )
+        hook.release_gate.set()
+        retry_launcher = FakeSandboxLauncher()
+        await recover_managed_credential_leases(
+            _hook_config(retry_launcher, hook),
+            HostStore(db_uri),
+        )
+
+        assert retry_launcher.terminated == ["sb-blocked-recovery"]
+        assert resources == set()
+        assert len(hook.release_calls) == 1
+        assert store.list_credential_leases(host_id) == []
+    finally:
+        engine.dispose()
 
 
 async def test_concurrent_generation_reservations_are_unique(db_uri: str) -> None:
@@ -3251,9 +3367,20 @@ async def test_launch_owner_renews_while_credential_acquire_is_blocked(
     await asyncio.wait_for(entered.wait(), timeout=2)
     initial = host_store.list_credential_leases()[0]
 
-    await asyncio.sleep(1.2)
+    # A second replica starting recovery while this launch owns the pending row
+    # must not terminate the in-flight sandbox.
+    await recover_managed_credential_leases(_hook_config(launcher, hook), HostStore(db_uri))
+    pending = host_store.list_credential_leases()[0]
+    assert pending.state == "pending"
+    assert launcher.terminated == []
 
-    renewed = host_store.list_credential_leases()[0]
+    for _ in range(100):
+        renewed = host_store.list_credential_leases()[0]
+        if renewed.owner_expires_at > initial.owner_expires_at:
+            break
+        await asyncio.sleep(0.02)
+    else:
+        pytest.fail("launch owner heartbeat did not renew its lease")
     assert renewed.owner_expires_at > initial.owner_expires_at
     await recover_managed_credential_leases(_hook_config(launcher, hook), host_store)
     assert launcher.terminated == []
