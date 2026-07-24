@@ -46,6 +46,32 @@ class _RaisingRunnerRouter:
         )
 
 
+class _CapturingRunnerClient:
+    """Runner client stub that records the delegated tools/list body."""
+
+    def __init__(self) -> None:
+        self.json: dict[str, object] | None = None
+
+    async def post(self, url: str, **kwargs: object) -> httpx.Response:
+        self.json = kwargs.get("json")  # type: ignore[assignment]
+        return httpx.Response(
+            200,
+            json={"result": {"schemas": [], "failures": {}}},
+            request=httpx.Request("POST", f"http://runner{url}"),
+        )
+
+
+class _CapturingRunnerRouter:
+    """Runner router stub backed by one capturing client."""
+
+    def __init__(self) -> None:
+        self.client = _CapturingRunnerClient()
+
+    def client_for_session_resources(self, conversation_id: str) -> RoutedRunner:
+        del conversation_id
+        return RoutedRunner(runner_id="runner_test", client=self.client)  # type: ignore[arg-type]
+
+
 @pytest.mark.asyncio
 async def test_mcp_tools_list_runner_failure_is_genericized(
     caplog: pytest.LogCaptureFixture,
@@ -79,3 +105,22 @@ async def test_mcp_tools_list_runner_failure_is_genericized(
     # ...but IS logged server-side for operators (the other half of the
     # contract — if missing, the failure has no diagnostic record).
     assert _RaisingRunnerClient.raw_error in caplog.text
+
+
+@pytest.mark.asyncio
+async def test_mcp_tools_list_forwards_active_actor_to_runner() -> None:
+    """Schema discovery must authenticate with the same actor as later calls."""
+    router = _CapturingRunnerRouter()
+
+    await _handle_mcp_tools_list(
+        rpc_id=1,
+        session_id="conv_test",
+        runner_router=router,  # type: ignore[arg-type]
+        actor={"run_as": "alice@example.com"},
+    )
+
+    assert router.client.json == {
+        "method": "tools/list",
+        "params": {},
+        "actor": {"run_as": "alice@example.com"},
+    }

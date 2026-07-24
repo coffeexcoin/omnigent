@@ -102,10 +102,20 @@ class _FakeMcpManager:
         """Schema set is a single-tool jira fixture."""
         self._tool_name = tool_name
         self.call_tool_invocations: list[tuple[str, dict[str, Any]]] = []
+        self.schema_actors: list[dict[str, str] | None] = []
+        self.schema_sessions: list[str | None] = []
+        self.call_tool_actors: list[dict[str, str] | None] = []
 
-    async def schemas_for(self, spec: AgentSpec) -> McpSchemasResult:
+    async def schemas_for(
+        self,
+        spec: AgentSpec,
+        actor: dict[str, str] | None = None,
+        session_id: str | None = None,
+    ) -> McpSchemasResult:
         """Return one MCP schema with the configured tool name."""
         del spec
+        self.schema_actors.append(actor)
+        self.schema_sessions.append(session_id)
         schema = {
             "type": "function",
             "name": self._tool_name,
@@ -124,6 +134,7 @@ class _FakeMcpManager:
         """Record the dispatch + return a fixed reply."""
         del spec
         self.call_tool_invocations.append((tool_name, arguments))
+        self.call_tool_actors.append(_kwargs.get("actor"))
         return f"called {tool_name}"
 
 
@@ -1434,6 +1445,41 @@ async def test_mcp_execute_dispatches_full_namespaced_mcp_tool_name() -> None:
     assert execute_resp.status_code == 200
     assert execute_resp.json() == {"result": {"output": "called jira__search_issues"}}
     assert mcp_manager.call_tool_invocations == [("jira__search_issues", {"query": "asyncio"})]
+
+
+@pytest.mark.asyncio
+async def test_mcp_execute_threads_actor_to_schema_and_tool_resolution() -> None:
+    """Runner execution must resolve both connector setup and calls as the active actor."""
+    app, mcp_manager, _harness_client, _server_client = _build_app_with_mcp_tool(
+        tool_name="jira__search_issues"
+    )
+    actor = {"run_as": "alice@example.com"}
+    async with _runner_client(app) as client:
+        seed_resp = await client.post(
+            "/v1/sessions",
+            json={
+                "session_id": "6a09e2c1b63301fc6be99bb645418905",
+                "agent_id": "0e36e3219954d2deaef06b8e2a936f38",
+            },
+        )
+        assert seed_resp.status_code == 201, seed_resp.text
+        list_resp = await client.post(
+            "/v1/sessions/6a09e2c1b63301fc6be99bb645418905/mcp/execute",
+            json={"method": "tools/list", "params": {}, "actor": actor},
+        )
+        call_resp = await client.post(
+            "/v1/sessions/6a09e2c1b63301fc6be99bb645418905/mcp/execute",
+            json={
+                "method": "tools/call",
+                "params": {"name": "jira__search_issues", "arguments": {}},
+                "actor": actor,
+            },
+        )
+
+    assert list_resp.status_code == call_resp.status_code == 200
+    assert mcp_manager.schema_actors == [actor]
+    assert mcp_manager.schema_sessions == ["6a09e2c1b63301fc6be99bb645418905"]
+    assert mcp_manager.call_tool_actors == [actor]
 
 
 @pytest.mark.asyncio

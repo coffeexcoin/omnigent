@@ -14322,6 +14322,8 @@ async def _handle_mcp_tools_list(
     rpc_id: int | str | None,
     session_id: str,
     runner_router: RunnerRouter | None,
+    *,
+    actor: dict[str, str] | None = None,
 ) -> Response:
     """
     Handle a ``tools/list`` JSON-RPC request for the MCP proxy endpoint.
@@ -14337,6 +14339,8 @@ async def _handle_mcp_tools_list(
         e.g. ``"conv_abc123"``.
     :param runner_router: Router used to get an httpx client pointed
         at the session's runner. ``None`` returns an error.
+    :param actor: Authenticated actor pinned to this turn. Forwarded to
+        runner-side credential resolution for schema discovery.
     :returns: A JSON-RPC 2.0 ``tools/list`` result response, or an
         error response when the runner is unavailable.
     """
@@ -14350,9 +14354,12 @@ async def _handle_mcp_tools_list(
         return _mcp_error_response(rpc_id, -32000, f"No runner bound for session {session_id!r}")
     _logger.debug("MCP tools/list: delegating to runner execute for session=%r", session_id)
     try:
+        runner_call: dict[str, Any] = {"method": "tools/list", "params": {}}
+        if actor is not None:
+            runner_call["actor"] = actor
         resp = await runner_client.post(
             f"/v1/sessions/{session_id}/mcp/execute",
-            json={"method": "tools/list", "params": {}},
+            json=runner_call,
             timeout=30.0,
         )
         resp.raise_for_status()
@@ -22316,10 +22323,24 @@ def create_sessions_router(
             )
 
         if method == "tools/list":
+            conv = await asyncio.to_thread(conversation_store.get_conversation, session_id)
+            if conv is None:
+                raise OmnigentError(
+                    f"Session {session_id!r} not found.",
+                    code=ErrorCode.NOT_FOUND,
+                )
+            turn_actor = _validated_runner_actor(
+                body.get("actor"),
+                tunnel_token=request.headers.get(RUNNER_TUNNEL_TOKEN_HEADER),
+                bound_runner_id=conv.runner_id,
+                allowed_tunnel_tokens=runner_tunnel_tokens,
+                require_runner_proof=permission_store is not None or user_id is not None,
+            )
             return await _handle_mcp_tools_list(
                 rpc_id,
                 session_id,
                 runner_router,
+                actor=turn_actor or _build_actor(user_id),
             )
 
         if method == "tools/call":
