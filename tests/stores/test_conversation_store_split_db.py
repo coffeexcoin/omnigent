@@ -336,6 +336,29 @@ def test_list_conversations_project_name_filter_crosses_dbs(
     assert labelled.id not in unfiled_ids
 
 
+# ── team scope ─────────────────────────────────────────
+
+
+def test_conversation_team_scope_crosses_dbs(
+    omnigent_db: Path, store: SqlAlchemyConversationStore
+) -> None:
+    """Team metadata drives filtering while conversation rows live separately."""
+    team_id = "d" * 32
+    scoped = store.create_conversation(title="scoped")
+    unscoped = store.create_conversation(title="unscoped")
+
+    assert store.set_conversation_team(scoped.id, team_id) is True
+    stored = _col(omnigent_db, "omnigent_conversation_metadata", "team_id", f"id=X'{scoped.id}'")
+    assert stored == [team_id]
+    fetched = store.get_conversation(scoped.id)
+    assert fetched is not None
+    assert fetched.team_id == team_id
+
+    page = store.list_conversations(team_id=team_id)
+    assert [conversation.id for conversation in page.data] == [scoped.id]
+    assert unscoped.id not in {conversation.id for conversation in page.data}
+
+
 # ── conversation items ─────────────────────────────────
 
 

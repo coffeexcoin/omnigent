@@ -4800,6 +4800,38 @@ def test_set_conversation_project_unknown_session_returns_false(
     assert result is False
 
 
+def test_set_and_filter_conversation_team(
+    conversation_store: SqlAlchemyConversationStore,
+) -> None:
+    """Team scope persists, filters lists, and can be cleared."""
+    team_id = "c" * 32
+    scoped = conversation_store.create_conversation(title="scoped")
+    unscoped = conversation_store.create_conversation(title="unscoped")
+
+    assert conversation_store.set_conversation_team(scoped.id, team_id) is True
+    fetched = conversation_store.get_conversation(scoped.id)
+    assert fetched is not None
+    assert fetched.team_id == team_id
+    assert conversation_store.get_conversations([scoped.id])[scoped.id].team_id == team_id
+
+    page = conversation_store.list_conversations(team_id=team_id)
+    assert [conversation.id for conversation in page.data] == [scoped.id]
+    assert unscoped.id not in {conversation.id for conversation in page.data}
+
+    assert conversation_store.set_conversation_team(scoped.id, None) is True
+    fetched = conversation_store.get_conversation(scoped.id)
+    assert fetched is not None
+    assert fetched.team_id is None
+    assert conversation_store.list_conversations(team_id=team_id).data == []
+
+
+def test_set_conversation_team_unknown_session_returns_false(
+    conversation_store: SqlAlchemyConversationStore,
+) -> None:
+    """Scoping a non-existent session updates nothing."""
+    assert conversation_store.set_conversation_team("f" * 32, "c" * 32) is False
+
+
 def test_list_conversations_filters_by_project_name_dual_read(
     conversation_store: SqlAlchemyConversationStore,
     db_uri: str,

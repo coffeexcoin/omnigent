@@ -25,6 +25,14 @@ from omnigent.entities.conversation import (
 )
 from omnigent.entities.device_grant import DeviceGrant
 from omnigent.entities.file import StoredFile
+from omnigent.entities.organization import (
+    MembershipRole,
+    Organization,
+    OrganizationMembership,
+    ResourceCapability,
+    Team,
+    TeamMembership,
+)
 from omnigent.entities.pagination import PagedList
 from omnigent.entities.permission import ResolvedAccess, SessionPermission
 from omnigent.entities.policy import Policy
@@ -55,14 +63,18 @@ __all__ = [
     "FunctionCallOutputData",
     "ItemData",
     "LoadedAgent",
+    "MembershipRole",
     "MessageData",
     "NativeToolData",
     "NewConversationItem",
+    "Organization",
+    "OrganizationMembership",
     "PagedList",
     "Policy",
     "Project",
     "ReasoningData",
     "ResolvedAccess",
+    "ResourceCapability",
     "ResourceEventData",
     "RoutingDecisionData",
     "ScheduledTask",
@@ -71,6 +83,8 @@ __all__ = [
     "SessionResourceView",
     "SlashCommandData",
     "StoredFile",
+    "Team",
+    "TeamMembership",
     "TerminalCommandData",
     "filter_resources_by_type",
     "get_resource_by_id",

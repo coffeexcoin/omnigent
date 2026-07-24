@@ -149,6 +149,9 @@ try:
     )
     from omnigent.stores.file_store.sqlalchemy_store import SqlAlchemyFileStore
     from omnigent.stores.host_store import HostStore
+    from omnigent.stores.organization_store.sqlalchemy_store import (
+        SqlAlchemyOrganizationStore,
+    )
     from omnigent.stores.permission_store.sqlalchemy_store import (
         SqlAlchemyPermissionStore,
     )
@@ -180,6 +183,7 @@ try:
     conversation_store = SqlAlchemyConversationStore(DB_URI)
     artifact_store = DatabricksVolumesArtifactStore(ARTIFACT_URI)
     file_comment_store = SqlAlchemyCommentStore(DB_URI)
+    organization_store = SqlAlchemyOrganizationStore(DB_URI)
     permission_store = SqlAlchemyPermissionStore(DB_URI)
     policy_store = SqlAlchemyPolicyStore(DB_URI)
     host_store = HostStore(DB_URI)
@@ -213,6 +217,7 @@ try:
         artifact_store=artifact_store,
         agent_cache=agent_cache,
         comment_store=file_comment_store,
+        organization_store=organization_store,
         permission_store=permission_store,
         policy_store=policy_store,
         host_store=host_store,

@@ -311,6 +311,7 @@ from omnigent.stores.conversation_store import (
 )
 from omnigent.stores.file_store import FileStore
 from omnigent.stores.host_store import Host, HostStore
+from omnigent.stores.organization_store import OrganizationStore
 from omnigent.stores.permission_store import PermissionStore
 from omnigent.stores.project_store import ProjectStore
 from omnigent.telemetry import emit as _tel_emit
@@ -2299,6 +2300,7 @@ def _build_session_list_item(
     pending_count: int,
     child_session_ids: list[str],
     comments_fingerprint: CommentsFingerprint | None,
+    visible_team_ids: set[str] | None = None,
 ) -> SessionListItem:
     """
     Assemble one :class:`SessionListItem` from a conversation row and
@@ -2395,6 +2397,11 @@ def _build_session_list_item(
         search_snippet=conv.search_snippet,
         parent_session_id=conv.parent_conversation_id,
         project_id=conv.project_id,
+        team_id=(
+            conv.team_id
+            if visible_team_ids is not None and conv.team_id in visible_team_ids
+            else None
+        ),
     )
 
 
@@ -2673,6 +2680,7 @@ def _build_session_response(
     pending_elicitation_events: list[dict[str, Any]] | None = None,
     subtree_usage: dict[str, Any] | None = None,
     model_options: list[dict[str, Any]] | None = None,
+    visible_team_ids: set[str] | None = None,
 ) -> SessionResponse:
     """
     Build a :class:`SessionResponse` from store-side entities.
@@ -2846,6 +2854,11 @@ def _build_session_response(
         # sessions whose forwarder stamps a turn id; ``None`` otherwise.
         active_response_id=_session_active_response_cache.get(conv.id),
         project_id=conv.project_id,
+        team_id=(
+            conv.team_id
+            if visible_team_ids is not None and conv.team_id in visible_team_ids
+            else None
+        ),
     )
 
 
@@ -14906,6 +14919,7 @@ def create_sessions_router(
     host_registry: HostRegistry | None = None,
     project_store: ProjectStore | None = None,
     background_title_coordinator: BackgroundSessionTitleCoordinator | None = None,
+    organization_store: OrganizationStore | None = None,
 ) -> APIRouter:
     """
     Factory that builds the sessions router.
@@ -14970,6 +14984,9 @@ def create_sessions_router(
         validate ownership when ``PATCH /v1/sessions/{id}`` files a
         session into a project. ``None`` disables the move-into-project
         action (a non-empty ``project_id`` is then rejected as unsupported).
+    :param organization_store: Organization/team membership store. Required
+        for assigning and filtering by session team scope. ``None`` disables
+        team-scoped operations in focused tests.
     :param background_title_coordinator: Optional app-owned coordinator for
         semantic title generation after first-turn forwarding. ``None`` disables
         background titles in focused router tests.
@@ -15436,6 +15453,13 @@ def create_sessions_router(
         _set_read_state(user_id, session_id, body.last_seen, body.unread)
         return Response(status_code=204)
 
+    async def _visible_team_ids_for_user(user_id: str | None) -> set[str]:
+        """Return team scopes the caller may see in resource responses."""
+        if organization_store is None or user_id is None:
+            return set()
+        teams = await asyncio.to_thread(organization_store.list_teams_for_user, user_id)
+        return {team.id for team in teams}
+
     # ── GET /sessions/{session_id} ───────────────────────────────
 
     @router.get(
@@ -15491,6 +15515,7 @@ def create_sessions_router(
         access = await _require_access_and_level(
             user_id, session_id, LEVEL_READ, permission_store, conversation_store
         )
+        visible_team_ids = await _visible_team_ids_for_user(user_id)
         return await _get_session_snapshot(
             conversation_store,
             session_id,
@@ -15504,6 +15529,7 @@ def create_sessions_router(
             refresh_state=refresh_state,
             host_store=getattr(request.app.state, "host_store", None),
             sandbox_config=getattr(request.app.state, "sandbox_config", None),
+            visible_team_ids=visible_team_ids,
         )
 
     @router.get(
@@ -15565,6 +15591,7 @@ def create_sessions_router(
         include_archived: bool = Query(default=False),
         kind: str = Query(default="default", pattern="^(default|sub_agent|any)$"),
         project: str | None = Query(default=None),
+        team_id: str | None = Query(default=None),
     ) -> PaginatedList:
         """
         List sessions with cursor-based pagination.
@@ -15608,6 +15635,8 @@ def create_sessions_router(
             this lets the new-session agent picker discover agents
             that are only bound to sub-agent sessions (e.g. ones
             uploaded via ``sys_session_create``).
+        :param team_id: Team discovery scope. The caller must be a member;
+            the filter is intersected with the existing session ACL.
         :returns: A :class:`PaginatedList` of
             :class:`SessionListItem`.
         """
@@ -15623,6 +15652,14 @@ def create_sessions_router(
         # with 401 instead (user_id stays None only when auth is
         # disabled entirely — no auth_provider).
         user_id = _require_user(request, auth_provider)
+        if team_id is not None:
+            if organization_store is None or user_id is None:
+                raise OmnigentError("Team not found", code=ErrorCode.NOT_FOUND)
+            is_member = await asyncio.to_thread(
+                organization_store.is_team_member, team_id, user_id
+            )
+            if not is_member:
+                raise OmnigentError("Team not found", code=ErrorCode.NOT_FOUND)
         normalized_query = search_query if search_query else None
         # A specific project folder ("My sessions"-only) must show only the
         # viewer's own sessions — a session shared with them but filed under a
@@ -15632,26 +15669,27 @@ def create_sessions_router(
         # The flat list (project=None) and Unfiled (project="") stay unscoped so
         # shared sessions still surface for the "Shared with me" tab.
         owned_by = user_id if project else None
-        page = await asyncio.to_thread(
-            conversation_store.list_conversations,
-            limit=limit,
-            after=after,
-            before=before,
-            agent_id=agent_id,
-            agent_name=agent_name,
-            accessible_by=user_id,
-            owned_by=owned_by,
-            has_agent_id=True,
-            # The store treats ``None`` as "no kind filter"; the API
-            # spells that ``kind=any`` to keep the param required-ish
-            # and pattern-validated.
-            kind=None if kind == "any" else kind,
-            order=order,
-            sort_by=sort_by,
-            search_query=normalized_query,
-            include_archived=include_archived,
-            project=project,
-        )
+        list_kwargs: dict[str, Any] = {
+            "limit": limit,
+            "after": after,
+            "before": before,
+            "agent_id": agent_id,
+            "agent_name": agent_name,
+            "accessible_by": user_id,
+            "owned_by": owned_by,
+            "has_agent_id": True,
+            "kind": None if kind == "any" else kind,
+            "order": order,
+            "sort_by": sort_by,
+            "search_query": normalized_query,
+            "include_archived": include_archived,
+            "project": project,
+        }
+        # Preserve duck-typed ConversationStore implementations that predate
+        # the optional team filter when it is not requested.
+        if team_id is not None:
+            list_kwargs["team_id"] = team_id
+        page = await asyncio.to_thread(conversation_store.list_conversations, **list_kwargs)
         # list_conversations may return rows with agent_id=None for
         # legacy conversations; skip them before building the batch IDs.
         conv_ids = [conv.id for conv in page.data if conv.agent_id is not None]
@@ -15694,6 +15732,7 @@ def create_sessions_router(
         # the index's lock per row but otherwise has no DB cost.
         pending_counts = pending_elicitations.counts_for(conv_ids)
         comments_fingerprints = await _comments_fingerprints_for(conv_ids)
+        visible_team_ids = await _visible_team_ids_for_user(user_id)
         items: list[SessionListItem] = [
             _build_session_list_item(
                 conv,
@@ -15705,6 +15744,7 @@ def create_sessions_router(
                 pending_count=pending_counts.get(conv.id, 0),
                 child_session_ids=child_ids_by_parent[conv.id],
                 comments_fingerprint=comments_fingerprints.get(conv.id),
+                visible_team_ids=visible_team_ids,
             )
             for conv in page.data
             if conv.agent_id is not None
@@ -15824,6 +15864,7 @@ def create_sessions_router(
             _comments_fingerprints_for(conv_ids),
         )
         pending_counts = pending_elicitations.counts_for(conv_ids)
+        visible_team_ids = await _visible_team_ids_for_user(user_id)
         items = [
             _build_session_list_item(
                 conv,
@@ -15835,6 +15876,7 @@ def create_sessions_router(
                 pending_count=pending_counts.get(conv.id, 0),
                 child_session_ids=child_ids_by_parent[conv.id],
                 comments_fingerprint=comments_fingerprints.get(conv.id),
+                visible_team_ids=visible_team_ids,
             )
             for conv in convs
         ]
@@ -16228,6 +16270,7 @@ def create_sessions_router(
         # editor must not move it. Presence is the signal (``""`` unfiles), so
         # gate on model_fields_set, not a non-None value.
         set_project = "project_id" in body.model_fields_set
+        set_team = "team_id" in body.model_fields_set
         # Archiving/unarchiving is an owner-only lifecycle action: it pairs
         # with a client-driven, owner-gated stop, so an editor must not be
         # able to archive a session (hiding it, and via the client stopping
@@ -16235,10 +16278,29 @@ def create_sessions_router(
         # endpoint needs only edit. Owner implies edit, so a single check at
         # the level the request actually requires gates both — no redundant
         # second permission-store read for archive/unarchive.
-        required_level = LEVEL_OWNER if (body.archived is not None or set_project) else LEVEL_EDIT
+        required_level = (
+            LEVEL_OWNER if (body.archived is not None or set_project or set_team) else LEVEL_EDIT
+        )
         await _require_access(
             user_id, session_id, required_level, permission_store, conversation_store
         )
+        target_team_id: str | None = None
+        if set_team:
+            if body.team_id is None:
+                raise OmnigentError(
+                    'team_id must be a team id or "" to clear; '
+                    "omit the field to leave scope unchanged",
+                    code=ErrorCode.INVALID_INPUT,
+                )
+            if body.team_id != "":
+                if organization_store is None or user_id is None:
+                    raise OmnigentError("Team not found", code=ErrorCode.NOT_FOUND)
+                is_member = await asyncio.to_thread(
+                    organization_store.is_team_member, body.team_id, user_id
+                )
+                if not is_member:
+                    raise OmnigentError("Team not found", code=ErrorCode.NOT_FOUND)
+                target_team_id = body.team_id
         if body.archived is True:
             await _best_effort_stop(session_id, conversation_store, runner_router)
         if body.runner_id is not None and permission_store is not None:
@@ -16595,7 +16657,16 @@ def create_sessions_router(
                 )
                 if not filed:
                     raise _session_not_found()
+        if set_team:
+            scoped = await asyncio.to_thread(
+                conversation_store.set_conversation_team,
+                session_id,
+                target_team_id,
+            )
+            if not scoped:
+                raise _session_not_found()
         level = await _get_permission_level(user_id, session_id, permission_store)
+        visible_team_ids = await _visible_team_ids_for_user(user_id)
         return await _get_session_snapshot(
             conversation_store,
             session_id,
@@ -16604,6 +16675,7 @@ def create_sessions_router(
             agent_cache,
             liveness_lookup=liveness_lookup,
             runner_exit_reports=runner_exit_reports,
+            visible_team_ids=visible_team_ids,
         )
 
     # ── POST /sessions/{source_id}/fork ─────────────────────────
@@ -16806,6 +16878,7 @@ def create_sessions_router(
             conversation_store.list_items, new_conv.id, limit=10000
         )
         level = await _get_permission_level(user_id, new_conv.id, permission_store)
+        visible_team_ids = await _visible_team_ids_for_user(user_id)
         return _build_session_response(
             new_conv,
             fork_items.data,
@@ -16813,6 +16886,7 @@ def create_sessions_router(
             permission_level=level,
             last_task_error=None,
             agent_name=base_agent.name,
+            visible_team_ids=visible_team_ids,
         )
 
     # ── POST /sessions/{session_id}/switch-agent ─────────────────
@@ -17020,6 +17094,7 @@ def create_sessions_router(
 
         items = await asyncio.to_thread(conversation_store.list_items, session_id, limit=10000)
         level = await _get_permission_level(user_id, session_id, permission_store)
+        visible_team_ids = await _visible_team_ids_for_user(user_id)
         return _build_session_response(
             updated,
             items.data,
@@ -17027,6 +17102,7 @@ def create_sessions_router(
             permission_level=level,
             last_task_error=None,
             agent_name=target_agent.name,
+            visible_team_ids=visible_team_ids,
         )
 
     # ── POST /sessions/{session_id}/hooks/permission-request ─────
@@ -22618,6 +22694,7 @@ async def _get_session_snapshot(
     refresh_state: bool = False,
     host_store: HostStore | None = None,
     sandbox_config: ManagedSandboxConfig | None = None,
+    visible_team_ids: set[str] | None = None,
 ) -> SessionResponse:
     """
     Read a full session snapshot from the store.
@@ -22880,4 +22957,5 @@ async def _get_session_snapshot(
             conv,
         ),
         subtree_usage=subtree_usage,
+        visible_team_ids=visible_team_ids,
     )

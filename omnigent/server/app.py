@@ -102,6 +102,7 @@ from omnigent.stores import (
 from omnigent.stores.comment_store import CommentStore
 from omnigent.stores.conversation_store import SessionConnectivity, runner_seen_is_fresh
 from omnigent.stores.host_store import HostStore
+from omnigent.stores.organization_store import OrganizationStore
 from omnigent.stores.permission_store import PermissionStore
 from omnigent.stores.policy_store import PolicyStore
 from omnigent.stores.project_store import ProjectStore
@@ -1145,6 +1146,7 @@ def create_app(
     sharing_mode: SharingMode | Callable[[], SharingMode] | None = None,
     public_sharing: bool | Callable[[], bool] | None = None,
     server_config: dict[str, Any] | None = None,
+    organization_store: OrganizationStore | None = None,
 ) -> FastAPI:
     """
     Build and return the FastAPI application with all routes mounted.
@@ -1181,6 +1183,8 @@ def create_app(
     :param project_store: Store for first-class projects (owner-private
         containers that group sessions). ``None`` disables the
         ``/v1/projects`` CRUD endpoints.
+    :param organization_store: Store for organizations, teams, and membership.
+        ``None`` disables session team-scope assignment and filtering.
     :param auth_provider: Pre-constructed auth provider for
         identity resolution. ``None`` disables auth (anonymous
         access). **Required** when ``permission_store`` is
@@ -2302,6 +2306,7 @@ def create_app(
             # Validates target-project ownership when PATCH /v1/sessions/{id}
             # files a session into a project (owner-private membership).
             project_store=project_store,
+            organization_store=organization_store,
             background_title_coordinator=background_title_coordinator,
         ),
         prefix="/v1",

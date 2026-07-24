@@ -4191,6 +4191,17 @@
             "title": "Status",
             "type": "string"
           },
+          "team_id": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Team Id"
+          },
           "title": {
             "anyOf": [
               {
@@ -5030,6 +5041,17 @@
             ],
             "description": "For sub-agent sessions, the sub-agent type name within the parent's spec tree, e.g. `\"summarizer\"`. `None` for top-level sessions.",
             "title": "Sub Agent Name"
+          },
+          "team_id": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Team Id"
           },
           "terminal_launch_args": {
             "anyOf": [
@@ -6238,6 +6260,18 @@
             "description": "When `True`, persist metadata changes but skip the runner-side side effects \u2014 specifically the native `/effort` / `/model` / Codex collaboration-mode forwards into the live runtime. Used by automatic bind-time handoffs (web's sticky-pref apply on session switch, the REPL's pre-create `/model` snapshot) where injecting a visible slash command into a freshly-spawned pane would render as an unexpected \"Command model X\" item before the user has sent anything. Default `False` preserves the user-driven picker / `/model` behaviour where the live forward IS the desired feedback.",
             "title": "Silent",
             "type": "boolean"
+          },
+          "team_id": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "Team id to scope this session under. Only the owner may change it, and only to a team they belong to. `\"\"` clears the scope. Omitting the field leaves it unchanged; explicit `null` is invalid.",
+            "title": "Team Id"
           },
           "terminal_launch_args": {
             "anyOf": [
@@ -8068,6 +8102,23 @@
                 }
               ],
               "title": "Project"
+            }
+          },
+          {
+            "description": "Team discovery scope. The caller must be a member; the filter is intersected with the existing session ACL.",
+            "in": "query",
+            "name": "team_id",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Team Id"
             }
           }
         ],

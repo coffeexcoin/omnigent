@@ -392,6 +392,113 @@ class SqlUser(OmnigentBase):
     last_login_at: Mapped[int | None] = mapped_column(Integer, nullable=True)
 
 
+class SqlOrganization(OmnigentBase):
+    """SQLAlchemy model for collaboration organizations."""
+
+    __tablename__ = "organizations"
+
+    workspace_id: Mapped[int] = mapped_column(
+        BigInteger,
+        primary_key=True,
+        nullable=False,
+        server_default="0",
+        default=current_workspace_id,
+    )
+    id: Mapped[str] = mapped_column(Uuid16(), primary_key=True)
+    name: Mapped[str] = mapped_column(String(256), nullable=False)
+    created_at: Mapped[int] = mapped_column(Integer, nullable=False)
+    updated_at: Mapped[int | None] = mapped_column(Integer, nullable=True)
+
+    __table_args__ = (Index("ix_organizations_name", "workspace_id", "name", unique=True),)
+
+
+class SqlOrganizationMembership(OmnigentBase):
+    """SQLAlchemy model for user membership in organizations."""
+
+    __tablename__ = "organization_memberships"
+
+    workspace_id: Mapped[int] = mapped_column(
+        BigInteger,
+        primary_key=True,
+        nullable=False,
+        server_default="0",
+        default=current_workspace_id,
+    )
+    organization_id: Mapped[str] = mapped_column(Uuid16(), primary_key=True)
+    user_id: Mapped[str] = mapped_column(String(128), primary_key=True)
+    # Stable membership-role code: member=1, admin=2.
+    role: Mapped[int] = mapped_column(SmallInteger, nullable=False)
+    created_at: Mapped[int] = mapped_column(Integer, nullable=False)
+
+    __table_args__ = (
+        CheckConstraint("role IN (1, 2)", name="ck_organization_memberships_role"),
+        Index(
+            "ix_organization_memberships_user_id",
+            "workspace_id",
+            "user_id",
+            "organization_id",
+        ),
+    )
+
+
+class SqlTeam(OmnigentBase):
+    """SQLAlchemy model for teams within an organization."""
+
+    __tablename__ = "teams"
+
+    workspace_id: Mapped[int] = mapped_column(
+        BigInteger,
+        primary_key=True,
+        nullable=False,
+        server_default="0",
+        default=current_workspace_id,
+    )
+    id: Mapped[str] = mapped_column(Uuid16(), primary_key=True)
+    organization_id: Mapped[str] = mapped_column(Uuid16(), nullable=False)
+    name: Mapped[str] = mapped_column(String(256), nullable=False)
+    created_at: Mapped[int] = mapped_column(Integer, nullable=False)
+    updated_at: Mapped[int | None] = mapped_column(Integer, nullable=True)
+
+    __table_args__ = (
+        Index(
+            "ix_teams_organization_name",
+            "workspace_id",
+            "organization_id",
+            "name",
+            unique=True,
+        ),
+    )
+
+
+class SqlTeamMembership(OmnigentBase):
+    """SQLAlchemy model for user membership in teams."""
+
+    __tablename__ = "team_memberships"
+
+    workspace_id: Mapped[int] = mapped_column(
+        BigInteger,
+        primary_key=True,
+        nullable=False,
+        server_default="0",
+        default=current_workspace_id,
+    )
+    team_id: Mapped[str] = mapped_column(Uuid16(), primary_key=True)
+    user_id: Mapped[str] = mapped_column(String(128), primary_key=True)
+    # Stable membership-role code: member=1, admin=2.
+    role: Mapped[int] = mapped_column(SmallInteger, nullable=False)
+    created_at: Mapped[int] = mapped_column(Integer, nullable=False)
+
+    __table_args__ = (
+        CheckConstraint("role IN (1, 2)", name="ck_team_memberships_role"),
+        Index(
+            "ix_team_memberships_user_id",
+            "workspace_id",
+            "user_id",
+            "team_id",
+        ),
+    )
+
+
 class SqlAccountToken(OmnigentBase):
     """
     SQLAlchemy model for the ``account_tokens`` table.
@@ -646,6 +753,9 @@ class SqlConversationMetadata(OmnigentBase):
     # (Rule R032). NULL = unfiled. Coexists with the implicit ``omni_project``
     # label via the store's dual-read until labels are consolidated.
     project_id: Mapped[str | None] = mapped_column(Uuid16(), nullable=True)
+    # Optional organization-team scope. Classification/discovery metadata only;
+    # access remains governed by session_permissions in the first slice.
+    team_id: Mapped[str | None] = mapped_column(Uuid16(), nullable=True)
 
     __table_args__ = (
         CheckConstraint("kind IN (1, 2)", name="ck_conversation_metadata_kind"),
@@ -657,6 +767,7 @@ class SqlConversationMetadata(OmnigentBase):
         Index("ix_conversation_metadata_runner_id", "workspace_id", "runner_id", "id"),
         # "list sessions in project X" + per-project counts (GROUP BY project_id).
         Index("ix_conversation_metadata_project_id", "workspace_id", "project_id", "id"),
+        Index("ix_conversation_metadata_team_id", "workspace_id", "team_id", "id"),
     )
 
 

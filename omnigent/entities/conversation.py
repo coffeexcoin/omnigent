@@ -183,6 +183,8 @@ class Conversation:
     :param project_id: The first-class project this session is filed
         under, or ``None`` if unfiled. Owner-private membership; see
         ``designs/PROJECTS_PRD.md``.
+    :param team_id: Optional team discovery scope. This classifies the
+        session but does not grant access to team members.
     :param search_snippet: Transient, list-only excerpt of the chat
         content that matched a ``search_query`` — set by
         ``list_conversations`` whenever the query hit an item's body (even
@@ -222,6 +224,7 @@ class Conversation:
     live_status: str | None = None
     pending_elicitation_count: int | None = None
     project_id: str | None = None
+    team_id: str | None = None
     # Transient: populated only by list_conversations on a content search;
     # never read from or written to the DB.
     search_snippet: str | None = None
