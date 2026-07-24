@@ -15600,9 +15600,10 @@ async def test_auto_create_claude_terminal_forwarder_skips_replayed_transcript_o
         session_id: str,
         external_session_id: str,
         workspace: Path,
+        config_dir: Path | None = None,
     ) -> Path:
         """Record the resume id and return a transcript path."""
-        del client, session_id, workspace
+        del client, session_id, workspace, config_dir
         synth_calls.append(external_session_id)
         return tmp_path / f"{external_session_id}.jsonl"
 
@@ -15750,8 +15751,9 @@ async def test_auto_create_claude_terminal_cold_resume_fallback_uses_pre_wipe_br
         session_id: str,
         external_session_id: str,
         workspace: Path,
+        config_dir: Path | None = None,
     ) -> Path:
-        del client, session_id, workspace
+        del client, session_id, workspace, config_dir
         synth_calls.append(external_session_id)
         return tmp_path / f"{external_session_id}.jsonl"
 

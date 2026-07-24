@@ -16,7 +16,7 @@ import re
 import shutil
 import tempfile
 import time
-from collections.abc import AsyncIterator, Awaitable, Callable, Iterable
+from collections.abc import AsyncIterator, Awaitable, Callable, Iterable, Mapping
 from contextlib import suppress
 from dataclasses import dataclass
 from pathlib import Path
@@ -668,7 +668,7 @@ def _resolve_codex_home_config_source(source_dir: Path, home_codex_home: Path) -
     return source_dir
 
 
-def _codex_home_config_source_from_env() -> Path:
+def _codex_home_config_source_from_env(env: Mapping[str, str] | None = None) -> Path:
     """
     Return the Codex home whose auth/config should be bridged.
 
@@ -681,9 +681,11 @@ def _codex_home_config_source_from_env() -> Path:
     :returns: Host Codex home to read ``auth.json`` and ``config.toml`` from,
         e.g. ``Path.home() / ".codex"`` or an explicit user ``CODEX_HOME``.
     """
+    source_env = os.environ if env is None else env
+    source_home = source_env.get("CODEX_HOME") or os.environ.get("CODEX_HOME")
     home_codex_home = Path.home() / ".codex"
     return _resolve_codex_home_config_source(
-        Path(os.environ.get("CODEX_HOME") or str(home_codex_home)),
+        Path(source_home or str(home_codex_home)),
         home_codex_home,
     )
 
@@ -764,6 +766,20 @@ def _populate_codex_home_config(target_dir: Path, source_dir: Path) -> None:
             dest_path.write_text(tomlkit.dumps(minimal_document))
             continue
         shutil.copy2(source_file, dest_path)
+
+
+def _rebind_codex_home_config(target_dir: Path, source_dir: Path) -> None:
+    """Replace bridged user config while preserving session rollout state."""
+
+    for filename in (
+        *_CODEX_HOME_SYMLINK_FILES,
+        *_CODEX_HOME_GLOBAL_INSTRUCTION_FILES,
+        *_CODEX_HOME_COPY_FILES,
+    ):
+        target = target_dir / filename
+        if target.is_symlink() or target.is_file():
+            target.unlink()
+    _populate_codex_home_config(target_dir, source_dir)
 
 
 def _databricks_codex_base_url(host: str) -> str:

@@ -512,6 +512,35 @@ async def test_get_client_respawns_on_model_change(
         await manager.shutdown()
 
 
+async def test_get_client_respawns_on_model_credential_scope_change(
+    manager: HarnessProcessManager,
+) -> None:
+    """An actor or credential-generation change rotates the harness process."""
+
+    from omnigent.runner.model_credentials import MODEL_CREDENTIAL_SCOPE_ENV
+
+    await manager.start()
+    try:
+        first = await manager.get_client(
+            "conv_a", _TEST_HARNESS_NAME, env={MODEL_CREDENTIAL_SCOPE_ENV: "alice-v1"}
+        )
+        pid_first = (await first.get("/pid")).json()["pid"]
+
+        same = await manager.get_client(
+            "conv_a", _TEST_HARNESS_NAME, env={MODEL_CREDENTIAL_SCOPE_ENV: "alice-v1"}
+        )
+        assert (await same.get("/pid")).json()["pid"] == pid_first
+
+        second = await manager.get_client(
+            "conv_a", _TEST_HARNESS_NAME, env={MODEL_CREDENTIAL_SCOPE_ENV: "bob-v1"}
+        )
+        pid_second = (await second.get("/pid")).json()["pid"]
+        assert pid_second != pid_first
+        assert _pid_alive(pid_second)
+    finally:
+        await manager.shutdown()
+
+
 async def test_get_client_any_harness_sentinel_reuses_subprocess(
     manager: HarnessProcessManager,
 ) -> None:

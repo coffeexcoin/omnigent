@@ -7994,6 +7994,7 @@ async def _ensure_native_terminal_ready(
     runner_client: httpx.AsyncClient,
     session_id: str,
     conv: Conversation,
+    created_by: str | None = None,
 ) -> _NativeTerminalEnsureOutcome:
     """
     Ask the runner to create or return the native terminal for a message.
@@ -8011,19 +8012,23 @@ async def _ensure_native_terminal_ready(
     :param session_id: Session/conversation identifier, e.g.
         ``"conv_abc123"``.
     :param conv: Conversation row used to identify the native harness.
+    :param created_by: Authenticated identity used for actor-scoped credentials.
     :returns: The probe outcome — a definitive ``error`` (terminal could
         not start) and/or a non-fatal ``policy_notice``.
     """
     display_name, _, harness = _native_terminal_runtime(conv)
     terminal_name = _native_terminal_name_for_harness(harness)
+    ensure_body: dict[str, Any] = {
+        "terminal": terminal_name,
+        "session_key": "main",
+        "ensure_native_terminal": True,
+    }
+    if created_by is not None:
+        ensure_body["actor"] = _build_actor(created_by)
     try:
         resp = await runner_client.post(
             f"/v1/sessions/{session_id}/resources/terminals",
-            json={
-                "terminal": terminal_name,
-                "session_key": "main",
-                "ensure_native_terminal": True,
-            },
+            json=ensure_body,
             timeout=10.0,
         )
     except (httpx.HTTPError, ConnectionError) as exc:
@@ -8408,6 +8413,7 @@ async def _forward_native_terminal_message(
     body: SessionEventInput,
     file_store: FileStore | None = None,
     artifact_store: ArtifactStore | None = None,
+    created_by: str | None = None,
 ) -> None:
     """
     Forward one Omnigent web-chat message to the native terminal harness.
@@ -8427,12 +8433,15 @@ async def _forward_native_terminal_message(
         content blocks.
     :param artifact_store: Optional binary content store for
         fetching file bytes during resolution.
+    :param created_by: Authenticated identity used for actor-scoped credentials.
     :returns: None.
     :raises HTTPException: 502 when the runner or harness rejects
         the injection request.
     """
     display_name, _, _ = _native_terminal_runtime(conv)
     event = _build_native_terminal_message_event(conv, body)
+    if created_by is not None:
+        event["actor"] = _build_actor(created_by)
     _logger.info(
         "%s terminal message forward starting: session=%s block_types=%s",
         display_name,
@@ -9777,6 +9786,7 @@ async def _dispatch_session_event_to_runner(
                 runner_client,
                 session_id,
                 conv,
+                created_by,
             )
         )
         if ensure_outcome.error is not None:
@@ -9880,6 +9890,7 @@ async def _dispatch_session_event_to_runner(
                 body,
                 file_store=file_store,
                 artifact_store=artifact_store,
+                created_by=created_by,
             )
             forwarded = True
         finally:

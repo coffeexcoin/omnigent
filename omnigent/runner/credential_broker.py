@@ -29,7 +29,7 @@ import time
 from collections.abc import Awaitable, Callable, Mapping, Sequence
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Literal, Protocol
+from typing import Literal, ParamSpec, Protocol, TypeVar
 from urllib.parse import urlparse
 
 from omnigent.policies.schema import ActorContext
@@ -171,33 +171,35 @@ class CredentialAuditEvent:
     session_id: str
     turn_id: str
     actor: ActorContext
-    tool: Literal["git", "gh"]
+    tool: Literal["git", "gh", "model"]
     action: str
     operation: Literal["identity", "credential"]
     outcome: Literal["allowed", "denied", "error"]
+    provider_id: str | None = None
+    billing_account_id: str | None = None
 
 
-class CredentialProvider(Protocol):
-    """Addon seam that mints credentials for the exact active turn.
+CredentialIssueParams = ParamSpec("CredentialIssueParams")
+CredentialGrantT = TypeVar("CredentialGrantT", covariant=True)
 
-    ``CredentialBrokerBridge`` calls :meth:`issue` only after authenticating an
-    opaque process capability and rebinding it to an immutable
-    ``(session_id, turn_id, actor)`` snapshot. Implementations must authorize
-    that full context, return the same actor on the grant, and keep credential
-    TTL at or below fifteen minutes. Providers must not infer a mutable actor
-    from session state after awaiting external work.
 
-    Secret values may exist only in ``CredentialGrant.secret`` and must never be
-    logged, included in exceptions, or persisted in session/API records. The
-    bridge injects a valid secret only into the trusted bounded Git/``gh`` child
-    process and redacts it from captured output. Launch-scoped providers own
-    their external lease lifecycle; turn and session capabilities are revoked by
-    the bridge independently.
+class CredentialProvider(Protocol[CredentialIssueParams, CredentialGrantT]):
+    """Addon seam that mints credentials for authenticated actor context.
+
+    Callers bind actor identity to an immutable request before awaiting
+    :meth:`issue`, then fence the returned grant against the still-current turn.
+    Providers must authorize the complete request and must not recover mutable
+    actor state after awaiting external work.
+
+    Secret values may exist only in the grant's redacted secret fields and must
+    never be logged, included in exceptions, or persisted in session/API
+    records. Callers inject valid grants only into trusted child processes and
+    own turn/session revocation independently from provider lease lifecycle.
     """
 
     async def issue(
-        self, context: ActiveCredentialTurn, request: CredentialRequest
-    ) -> CredentialGrant: ...
+        self, *args: CredentialIssueParams.args, **kwargs: CredentialIssueParams.kwargs
+    ) -> CredentialGrantT: ...
 
 
 AuditSink = Callable[[CredentialAuditEvent], Awaitable[None] | None]
@@ -228,7 +230,7 @@ class CredentialBrokerBridge:
 
     def __init__(
         self,
-        provider: CredentialProvider,
+        provider: CredentialProvider[[ActiveCredentialTurn, CredentialRequest], CredentialGrant],
         *,
         audit_sink: AuditSink | None = None,
         wrapper_dir: Path | None = None,
@@ -526,9 +528,9 @@ class CredentialBrokerBridge:
                 event.outcome,
             )
             if self._audit_sink is not None:
-                result = self._audit_sink(event)
-                if inspect.isawaitable(result):
-                    await result
+                audit_result = self._audit_sink(event)
+                if inspect.isawaitable(audit_result):
+                    await audit_result
 
     def _execute(
         self,

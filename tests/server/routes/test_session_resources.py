@@ -3600,6 +3600,7 @@ async def test_kiro_native_dispatch_forwards_without_persisting() -> None:
             "/v1/sessions/823dbd1aab969b5a813fac59bb977a77/resources/terminals",
             "/v1/sessions/823dbd1aab969b5a813fac59bb977a77/events",
         ]
+        assert client.post_json_calls[0][1]["actor"] == {"run_as": "alice@example.com"}
         pending = pending_inputs.snapshot_for("823dbd1aab969b5a813fac59bb977a77")
         assert len(pending) == 1
         assert pending[0]["content"] == [{"type": "input_text", "text": "hello"}]
@@ -3607,6 +3608,7 @@ async def test_kiro_native_dispatch_forwards_without_persisting() -> None:
         forwarded = client.post_json_calls[1][1]
         assert forwarded["agent_id"] == "2c515637c67d0717ad0bebc2747b71bc"
         assert forwarded["model"] == "kiro-native-ui"
+        assert forwarded["actor"] == {"run_as": "alice@example.com"}
     finally:
         pending_inputs.reset_for_tests()
 

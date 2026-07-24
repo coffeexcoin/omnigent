@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import inspect
 import logging
 import os
 import signal
@@ -32,7 +33,12 @@ if TYPE_CHECKING:
     from types import TracebackType
 
     from omnigent.runner.app import ResolvedSpec
+    from omnigent.runner.credential_broker import CredentialProvider
     from omnigent.runner.mcp_credentials import McpCredentialResolver
+    from omnigent.runner.model_credentials import (
+        ModelCredentialGrant,
+        ModelCredentialRequest,
+    )
     from omnigent.runner.transports.ws_tunnel.serve import _ASGIApp
 
 _RUNNER_SERVER_URL_ENV_VAR = "RUNNER_SERVER_URL"
@@ -1006,12 +1012,14 @@ async def _shutdown_runner_resources(
     terminal_registry: _AsyncShutdownable,
     mcp_manager: _AsyncShutdownable | None,
     server_client: _AsyncAcloseable,
+    model_credential_provider: _AsyncCloseable | None = None,
 ) -> None:
     """Attempt every runner cleanup step and re-raise the first failure."""
 
     steps = (
         ("credential bridge", credential_bridge, "close"),
         ("credential provider", credential_provider, "aclose"),
+        ("model credential provider", model_credential_provider, "close"),
         ("native pane reaper", pane_reaper, "shutdown"),
         ("process manager", process_manager, "shutdown"),
         ("terminal registry", terminal_registry, "shutdown"),
@@ -1023,7 +1031,9 @@ async def _shutdown_runner_resources(
         if resource is None:
             continue
         try:
-            await getattr(resource, method_name)()
+            result = getattr(resource, method_name)()
+            if inspect.isawaitable(result):
+                await result
         except BaseException as exc:  # noqa: BLE001 - finish independent cleanup first
             if first_error is None:
                 first_error = exc
@@ -1037,6 +1047,8 @@ async def _shutdown_runner_resources(
 def create_app(
     auth_token_factory: Callable[[], str | None] | None = None,
     mcp_credential_resolver: McpCredentialResolver | None = None,
+    model_credential_provider: CredentialProvider[[ModelCredentialRequest], ModelCredentialGrant]
+    | None = None,
 ) -> FastAPI:
     """Factory for the runner FastAPI app exposing the harness-contract subset.
 
@@ -1046,6 +1058,8 @@ def create_app(
         the app builds its own.
     :param mcp_credential_resolver: Optional deployment hook for actor-aware
         HTTP and stdio MCP credentials.
+    :param model_credential_provider: Optional deployment hook for actor-aware
+        model-provider credentials.
     :returns: A runner FastAPI app exposing the harness-contract subset.
     """
     from omnigent.runner.app import create_runner_app
@@ -1204,6 +1218,7 @@ def create_app(
         auth_token=runner_auth_token,
         auth_token_factory=auth_token_factory,
         credential_provider=github_credential_provider,
+        model_credential_provider=model_credential_provider,
     )
 
     async def _start_pm() -> None:
@@ -1239,10 +1254,16 @@ def create_app(
         """
         credential_bridge = getattr(app.state, "credential_broker", None)
         _pane_reaper = getattr(app.state, "native_pane_reaper", None)
+        model_credential_resource = (
+            cast("_AsyncCloseable", model_credential_provider)
+            if callable(getattr(model_credential_provider, "close", None))
+            else None
+        )
         try:
             await _shutdown_runner_resources(
                 credential_bridge=credential_bridge,
                 credential_provider=github_credential_provider,
+                model_credential_provider=model_credential_resource,
                 pane_reaper=_pane_reaper,
                 process_manager=pm,
                 terminal_registry=_terminal_registry,

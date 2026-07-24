@@ -41,6 +41,7 @@ from omnigent.harness_plugins import missing_install_packages
 from omnigent.inner import _proc
 from omnigent.inner._subprocess_lifecycle import close_subprocess_transport
 from omnigent.runner.identity import strip_runner_auth_secrets
+from omnigent.runner.model_credentials import MODEL_CREDENTIAL_SCOPE_ENV
 from omnigent.runtime.harnesses import _HARNESS_MODULES
 
 _logger = logging.getLogger(__name__)
@@ -464,12 +465,14 @@ class _SubprocessEntry:
         endpoint: _HarnessEndpoint,
         harness: str,
         model: str | None = None,
+        model_credential_scope: str | None = None,
     ) -> None:
         self.process = process
         self.client = client
         self.endpoint = endpoint
         self.harness = harness
         self.model = model
+        self.model_credential_scope = model_credential_scope
         self.last_used_at: float = 0.0
 
 
@@ -662,8 +665,9 @@ class HarnessProcessManager:
         runner subprocess of the right harness type, waits for the
         Unix socket to appear, and constructs an
         :class:`httpx.AsyncClient` over it. Subsequent calls
-        return the cached client (``env`` is ignored on cache
-        hits — config is fixed at first-spawn time).
+        return the cached client unless the requested harness, model, or
+        model-credential scope changed. Other ``env`` values are ignored on
+        cache hits because process configuration is fixed at spawn time.
 
         Crash detection: if the previously-spawned subprocess has
         exited (``returncode is not None``), the entry is dropped
@@ -689,7 +693,8 @@ class HarnessProcessManager:
             workflow dispatch to thread per-spec executor config
             into the subprocess without polluting AP's own
             ``os.environ`` (which would race across concurrent
-            conversations with different specs).
+            conversations with different specs). A changed
+            ``OMNIGENT_MODEL_CREDENTIAL_SCOPE`` value rotates the process.
         :returns: The cached or freshly-constructed
             :class:`httpx.AsyncClient` bound to the
             per-conversation Unix socket.
@@ -772,6 +777,17 @@ class HarnessProcessManager:
                         conversation_id,
                         entry.model,
                         requested_model,
+                    )
+                    await self._close_entry(entry)
+                    entry = None
+            if entry is not None:
+                requested_scope = (env or {}).get(MODEL_CREDENTIAL_SCOPE_ENV)
+                if requested_scope is not None and requested_scope != entry.model_credential_scope:
+                    _logger.info(
+                        "harness %s for conversation %s: "
+                        "model credential scope changed; respawning",
+                        harness,
+                        conversation_id,
                     )
                     await self._close_entry(entry)
                     entry = None
@@ -1180,7 +1196,8 @@ class HarnessProcessManager:
                 # turn requesting a different model (e.g. after ``/model``)
                 # triggers a respawn in ``get_client`` — the model is a fixed
                 # process env var, not re-read per turn.
-                model=(env or {}).get(_model_env_key(harness)),
+                model=effective_env.get(_model_env_key(harness)),
+                model_credential_scope=effective_env.get(MODEL_CREDENTIAL_SCOPE_ENV),
             )
         except BaseException:
             # From spawn onward the process must have exactly one owner:

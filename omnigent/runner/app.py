@@ -11,6 +11,7 @@ from __future__ import annotations
 import asyncio
 import contextlib
 import dataclasses
+import inspect
 import json
 import logging
 import mimetypes
@@ -24,14 +25,20 @@ import urllib.parse
 import uuid
 from collections.abc import AsyncIterator, Awaitable, Callable, Mapping
 from pathlib import Path
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING, Any, Literal
 
 if TYPE_CHECKING:
     # Type-only import: the runner keeps codex deps out of its runtime import
     # graph (they are imported lazily inside the codex-native helpers).
     from omnigent.claude_native import ClaudeNativeUcodeConfig
     from omnigent.codex_native_app_server import CodexAppServerClient
-    from omnigent.runner.credential_broker import AuditSink, CredentialProvider
+    from omnigent.runner.credential_broker import (
+        ActiveCredentialTurn,
+        AuditSink,
+        CredentialGrant,
+        CredentialProvider,
+        CredentialRequest,
+    )
     from omnigent.terminals.registry import TerminalListEntry
 
 import httpx
@@ -63,6 +70,12 @@ from omnigent.policies.schema import ActorContext, validate_actor_context
 from omnigent.policies.types import FAIL_CLOSED_PHASES
 from omnigent.runner import pending_approvals
 from omnigent.runner.codex.goal import CodexGoalRunner
+from omnigent.runner.model_credentials import (
+    MODEL_CREDENTIAL_SCOPE_ENV,
+    ModelCredentialGrant,
+    ModelCredentialRequest,
+    apply_model_credential,
+)
 from omnigent.runner.proxy_mcp_manager import ProxyMcpManager
 from omnigent.runner.resource_registry import (
     ANTIGRAVITY_NATIVE_TERMINAL_ROLE,
@@ -3566,6 +3579,7 @@ async def _auto_create_codex_terminal(
     agent_spec: AgentSpec | ResolvedSpec | None = None,
     server_client: httpx.AsyncClient | None = None,
     ensure_comment_relay: Callable[..., Awaitable[None]] | None = None,
+    model_credential_env: Mapping[str, str] | None = None,
 ) -> SessionResourceView:
     """
     Auto-create a Codex terminal for a codex-native session.
@@ -3611,6 +3625,7 @@ async def _auto_create_codex_terminal(
 
     from omnigent.codex_native_app_server import (
         CodexAppServerClient,
+        NativeCodexLaunch,
         build_codex_native_server,
         build_codex_remote_args,
         codex_session_meta_model_provider,
@@ -3635,6 +3650,16 @@ async def _auto_create_codex_terminal(
     bridge_dir = prepare_bridge_dir(session_id)
     socket_path = socket_path_for_bridge_dir(bridge_dir)
     codex_home = codex_home_for_bridge_dir(bridge_dir)
+    if model_credential_env and model_credential_env.get("CODEX_HOME"):
+        from omnigent.inner.codex_executor import (
+            _codex_home_config_source_from_env,
+            _rebind_codex_home_config,
+        )
+
+        _rebind_codex_home_config(
+            codex_home,
+            _codex_home_config_source_from_env(model_credential_env),
+        )
     # Route across all offerings: a configured provider (omnigent setup),
     # a Databricks ucode profile from provider config, or Codex's own
     # login — parity with the in-process codex harness and the CLI path.
@@ -3642,7 +3667,11 @@ async def _auto_create_codex_terminal(
     # synthesis can stamp session_meta.model_provider with the provider
     # this launch actually routes through.
     default_model = launch_config.model_override or _codex_native_model_from_spec(agent_spec)
-    _codex_launch = resolve_native_codex_launch(model=default_model)
+    _codex_launch = (
+        NativeCodexLaunch(config_overrides=[], model=default_model, profile=None)
+        if model_credential_env
+        else resolve_native_codex_launch(model=default_model)
+    )
     _session_meta_provider = codex_session_meta_model_provider(_codex_launch)
     from omnigent.inner.codex_executor import _find_codex_cli
 
@@ -3867,6 +3896,7 @@ async def _auto_create_codex_terminal(
         ap_server_url=launch_config.policy_server_url,
         ap_auth_headers=policy_headers,
         bypass_sandbox=launch_config.bypass_sandbox,
+        model_credential_env=model_credential_env,
     )
     app_server.listen_url = codex_ws_url
     await app_server.start()
@@ -5616,6 +5646,7 @@ async def _auto_create_claude_terminal(
     skills_filter: str | list[str] = "all",
     session_init: RunnerSessionInitEnvelope | None = None,
     auth_token_factory: Callable[[], str | None] | None = None,
+    model_credential_env: Mapping[str, str] | None = None,
 ) -> SessionResourceView:
     """
     Auto-create a Claude Code terminal for a claude-native session.
@@ -5824,6 +5855,11 @@ async def _auto_create_claude_terminal(
                 session_id=session_id,
                 external_session_id=session_external_id,
                 workspace=Path(workspace).resolve(),
+                config_dir=(
+                    Path(model_credential_env["CLAUDE_CONFIG_DIR"]).expanduser()
+                    if model_credential_env and model_credential_env.get("CLAUDE_CONFIG_DIR")
+                    else None
+                ),
             )
             if _transcript is not None:
                 resume_external_session_id = session_external_id
@@ -5916,6 +5952,11 @@ async def _auto_create_claude_terminal(
                 session_id=session_id,
                 external_session_id=our_uuid,
                 workspace=_clone_workspace,
+                config_dir=(
+                    Path(model_credential_env["CLAUDE_CONFIG_DIR"]).expanduser()
+                    if model_credential_env and model_credential_env.get("CLAUDE_CONFIG_DIR")
+                    else None
+                ),
             )
         except Exception:  # noqa: BLE001 — best-effort; launch fresh on failure
             _built = None
@@ -5974,17 +6015,18 @@ async def _auto_create_claude_terminal(
     # provider selection just like the in-process claude-sdk harness and the
     # CLI path.
     claude_config: ClaudeNativeUcodeConfig | None = None
-    try:
-        claude_config = resolve_native_claude_config(spec=None)
-    except Exception:  # noqa: BLE001 — best-effort; fall back to native auth
-        _logger.warning(
-            "native-claude: could not derive a provider/ucode launch config "
-            "— FALLING BACK to Claude Code's own login; "
-            "your configured provider will NOT be used. Check "
-            "`omnigent setup --no-internal-beta` "
-            "and that the secret resolves in this process.",
-            exc_info=True,
-        )
+    if not model_credential_env:
+        try:
+            claude_config = resolve_native_claude_config(spec=None)
+        except Exception:  # noqa: BLE001 — best-effort; fall back to native auth
+            _logger.warning(
+                "native-claude: could not derive a provider/ucode launch config "
+                "— FALLING BACK to Claude Code's own login; "
+                "your configured provider will NOT be used. Check "
+                "`omnigent setup --no-internal-beta` "
+                "and that the secret resolves in this process.",
+                exc_info=True,
+            )
     _logger.info(
         "Claude terminal provider config resolved: session=%s configured=%s "
         "env_keys=%s api_key_helper_set=%s model_set=%s",
@@ -6033,6 +6075,8 @@ async def _auto_create_claude_terminal(
     launch_command, launch_args = resolve_claude_launch("claude", list(claude_args))
 
     claude_terminal_env_unset = _claude_terminal_env_unset(claude_config)
+    terminal_env = build_native_claude_terminal_env(claude_config)
+    terminal_env.update(model_credential_env or {})
 
     # Inherit the agent's os_env so its sandbox (e.g. ``type: none``),
     # egress_rules and env_passthrough are honoured. Without ``sandbox`` here
@@ -6050,7 +6094,7 @@ async def _auto_create_claude_terminal(
         # Tool Search env plus ucode gateway env (ANTHROPIC_BASE_URL
         # etc.) when derived. Empty provider config still forces
         # ENABLE_TOOL_SEARCH=true so MCP schemas are loaded on demand.
-        env=build_native_claude_terminal_env(claude_config),
+        env=terminal_env,
         # Names to strip (see ``_claude_terminal_env_unset``). Dropping
         # ``DATABRICKS_CONFIG_PROFILE`` matters because Claude's MCP servers
         # inherit this env and several build ``WorkspaceClient`` without pinning
@@ -8180,8 +8224,13 @@ def create_runner_app(
     mcp_manager: Any | None = None,
     auth_token: str | None = None,
     auth_token_factory: Callable[[], str | None] | None = None,
-    credential_provider: CredentialProvider | None = None,
+    credential_provider: CredentialProvider[
+        [ActiveCredentialTurn, CredentialRequest], CredentialGrant
+    ]
+    | None = None,
     credential_audit_sink: AuditSink | None = None,
+    model_credential_provider: CredentialProvider[[ModelCredentialRequest], ModelCredentialGrant]
+    | None = None,
 ) -> FastAPI:
     """Build a fresh runner FastAPI app.
 
@@ -8221,6 +8270,8 @@ def create_runner_app(
         Git and GitHub CLI credentials. ``None`` leaves PATH unchanged.
     :param credential_audit_sink: Optional secret-free audit callback invoked
         for every authorized broker request.
+    :param model_credential_provider: Optional trusted addon provider resolving
+        model API/gateway or native CLI credentials for the active actor turn.
     """
     import hmac
 
@@ -8242,11 +8293,36 @@ def create_runner_app(
             audit_sink=credential_audit_sink,
         )
 
-        async def _close_credential_bridge() -> None:
-            await credential_bridge.close()
-
-        app.router.add_event_handler("shutdown", _close_credential_bridge)
     app.state.credential_broker = credential_bridge
+
+    credential_resources_closed = False
+
+    async def _close_credential_resources() -> None:
+        """Release runner-owned broker and optional addon provider resources."""
+
+        nonlocal credential_resources_closed
+        if credential_resources_closed:
+            return
+        credential_resources_closed = True
+        if credential_bridge is not None:
+            await credential_bridge.close()
+        close = getattr(model_credential_provider, "close", None)
+        if callable(close):
+            result = close()
+            if inspect.isawaitable(result):
+                await result
+
+    app.router.add_event_handler("shutdown", _close_credential_resources)
+    app.state.close_credential_resources = _close_credential_resources
+
+    async def _release_model_credential_session(session_id: str) -> None:
+        """Release optional provider state allocated for one session."""
+
+        release = getattr(model_credential_provider, "release_session", None)
+        if callable(release):
+            result = release(session_id)
+            if inspect.isawaitable(result):
+                await result
 
     async def _credential_wrapper_environment(
         session_id: str,
@@ -8273,23 +8349,185 @@ def create_runner_app(
         wrapped.update(await _credential_wrapper_environment(session_id, spawn_env))
         return wrapped
 
+    _model_credential_turns: dict[str, tuple[str, str]] = {}
+
+    async def _emit_model_credential_audit(
+        request: ModelCredentialRequest,
+        outcome: Literal["allowed", "denied", "error"],
+        grant: ModelCredentialGrant | None = None,
+    ) -> None:
+        from omnigent.runner.credential_broker import CredentialAuditEvent
+
+        event = CredentialAuditEvent(
+            session_id=request.session_id,
+            turn_id=request.turn_id,
+            actor=request.actor,
+            tool="model",
+            action=request.harness,
+            operation="credential",
+            outcome=outcome,
+            provider_id=grant.provider_id if grant is not None else None,
+            billing_account_id=(grant.billing_account_id if grant is not None else None),
+        )
+        _logger.info(
+            "model credential session=%r turn=%r actor=%r harness=%s "
+            "provider=%r billing_account=%r outcome=%s",
+            event.session_id,
+            event.turn_id,
+            event.actor.get("run_as", ""),
+            event.action,
+            event.provider_id,
+            event.billing_account_id,
+            event.outcome,
+        )
+        if credential_audit_sink is None:
+            return
+        try:
+            result = credential_audit_sink(event)
+            if inspect.isawaitable(result):
+                await result
+        except Exception as exc:  # noqa: BLE001 -- audit sink is deployment code
+            _logger.warning("model credential audit sink failed: %s", type(exc).__name__)
+
+    def _assert_current_model_credential_turn(session_id: str, turn_id: str | None) -> None:
+        """Fence setup work that lost authority to a newer actor turn."""
+
+        active = _model_credential_turns.get(session_id)
+        if model_credential_provider is not None and (
+            turn_id is None or active is None or active[0] != turn_id
+        ):
+            raise RuntimeError("stale actor model credential turn")
+
+    async def _with_model_credential(
+        session_id: str,
+        harness: str,
+        actor: ActorContext | None,
+        turn_id: str | None,
+        spawn_env: dict[str, str] | None,
+    ) -> tuple[dict[str, str] | None, dict[str, str], str | None]:
+        """Resolve and attach actor-scoped model process configuration."""
+
+        if model_credential_provider is None:
+            return spawn_env, {}, None
+        if actor is None:
+            raise ValueError("actor is required when model credential brokering is enabled")
+        _assert_current_model_credential_turn(session_id, turn_id)
+        request = ModelCredentialRequest(
+            session_id=session_id,
+            turn_id=turn_id or f"turn_{uuid.uuid4().hex}",
+            actor=actor.copy(),
+            harness=harness,
+            model=(spawn_env or {}).get(f"HARNESS_{harness.upper().replace('-', '_')}_MODEL"),
+        )
+        try:
+            grant = await model_credential_provider.issue(request)
+        except Exception:
+            await _emit_model_credential_audit(request, "error")
+            raise
+        try:
+            _assert_current_model_credential_turn(session_id, turn_id)
+        except RuntimeError:
+            await _emit_model_credential_audit(request, "denied", grant)
+            raise
+        try:
+            merged = apply_model_credential(spawn_env, request, grant)
+        except (TypeError, ValueError):
+            await _emit_model_credential_audit(request, "error", grant)
+            raise
+        await _emit_model_credential_audit(request, "allowed", grant)
+        return merged, dict(grant.environment), merged.get(MODEL_CREDENTIAL_SCOPE_ENV)
+
+    _native_model_credential_scopes: dict[str, str] = {}
+    _native_model_credential_locks: dict[str, asyncio.Lock] = {}
+
+    async def _ensure_actor_native_terminal(
+        session_id: str,
+        harness: str,
+        credential_env: Mapping[str, str],
+        credential_scope: str | None,
+        turn_id: str | None,
+    ) -> None:
+        """Rotate native Claude/Codex onto the active actor's credential home."""
+
+        if credential_scope is None or harness not in {"claude-native", "codex-native"}:
+            return
+        if resource_registry is None or resource_registry.terminal_registry is None:
+            return
+        _assert_current_model_credential_turn(session_id, turn_id)
+        lock = _native_model_credential_locks.setdefault(session_id, asyncio.Lock())
+        async with lock:
+            _assert_current_model_credential_turn(session_id, turn_id)
+            terminal_name = "claude" if harness == "claude-native" else "codex"
+            registry = resource_registry.terminal_registry
+            existing = registry.get(session_id, terminal_name, "main")
+            if (
+                _native_model_credential_scopes.get(session_id) == credential_scope
+                and existing is not None
+            ):
+                return
+            if existing is not None:
+                await registry.close(session_id, terminal_name, "main")
+            await _cancel_auto_forwarder_task(session_id)
+            if process_manager is not None:
+                await process_manager.release(session_id)
+            try:
+                agent_spec = await _resolve_session_agent_spec(session_id)
+            except OmnigentError:
+                agent_spec = None
+            _assert_current_model_credential_turn(session_id, turn_id)
+            if harness == "claude-native":
+                await _auto_create_claude_terminal(
+                    session_id,
+                    resource_registry,
+                    _publish_event,
+                    server_client=server_client,
+                    agent_spec=agent_spec,
+                    auth_token_factory=auth_token_factory,
+                    model_credential_env=credential_env,
+                )
+            else:
+                await _auto_create_codex_terminal(
+                    session_id,
+                    resource_registry,
+                    _publish_event,
+                    agent_spec=agent_spec,
+                    server_client=server_client,
+                    ensure_comment_relay=_ensure_comment_relay_started,
+                    model_credential_env=credential_env,
+                )
+            try:
+                _assert_current_model_credential_turn(session_id, turn_id)
+            except RuntimeError:
+                await registry.close(session_id, terminal_name, "main")
+                _native_model_credential_scopes.pop(session_id, None)
+                raise
+            _native_model_credential_scopes[session_id] = credential_scope
+
     def _bind_credential_turn(
         session_id: str,
         actor: ActorContext | None,
         raw_turn_id: object,
     ) -> str | None:
-        if credential_bridge is None:
-            return None
-        if actor is None:
-            credential_bridge.deactivate_session(session_id)
-            return None
-        from omnigent.runner.credential_broker import ActiveCredentialTurn
-
         turn_id = (
             raw_turn_id
             if isinstance(raw_turn_id, str) and raw_turn_id
             else f"turn_{uuid.uuid4().hex}"
         )
+        if model_credential_provider is not None:
+            if actor is None:
+                _model_credential_turns.pop(session_id, None)
+            else:
+                _model_credential_turns[session_id] = (
+                    turn_id,
+                    actor.get("run_as", ""),
+                )
+        if credential_bridge is None:
+            return turn_id
+        if actor is None:
+            credential_bridge.deactivate_session(session_id)
+            return None
+        from omnigent.runner.credential_broker import ActiveCredentialTurn
+
         credential_bridge.bind_turn(
             ActiveCredentialTurn(
                 session_id=session_id,
@@ -9764,8 +10002,9 @@ def create_runner_app(
         # Auto-bootstrap: if this is a claude-native session and no
         # terminal exists yet, create one. This handles the case
         # where a host-spawned runner receives a session assignment
-        # without the CLI having created the terminal.
-        if harness_name == "claude-native":
+        # without the CLI having created the terminal. An actor credential
+        # provider defers launch until the first authenticated turn.
+        if harness_name == "claude-native" and model_credential_provider is None:
             terminal_ready = False
             # Serialize the check-and-create: a concurrent POST /v1/sessions
             # (from _on_runner_connect and the message path's relaunch
@@ -9923,7 +10162,7 @@ def create_runner_app(
                         session_id,
                     )
 
-        if harness_name == "codex-native":
+        if harness_name == "codex-native" and model_credential_provider is None:
             # Same concurrency guard as the claude branch: two POST
             # /v1/sessions (connect callback + relaunch handshake) — or a
             # concurrent terminals-endpoint "ensure" — must not both pass
@@ -10438,8 +10677,9 @@ def create_runner_app(
                     "agent_id": agent_id,
                     "model": body.get("model", agent_id),
                 }
+                credential_turn_id = _bind_credential_turn(session_id, None, None)
                 _turn_task = asyncio.create_task(
-                    _run_turn_bg(msg_body, session_id),
+                    _run_turn_bg(msg_body, session_id, credential_turn_id),
                     name=f"turn-recover-{session_id}",
                 )
                 _active_turns[session_id] = _turn_task
@@ -10711,6 +10951,18 @@ def create_runner_app(
 
         if process_manager is not None:
             await process_manager.release(session_id)
+
+        try:
+            await _release_model_credential_session(session_id)
+        except Exception as exc:  # noqa: BLE001 -- deployment provider boundary
+            _logger.warning(
+                "model credential session release failed for %s: %s",
+                session_id,
+                type(exc).__name__,
+            )
+        _model_credential_turns.pop(session_id, None)
+        _native_model_credential_scopes.pop(session_id, None)
+        _native_model_credential_locks.pop(session_id, None)
 
         # Pane close above does not touch the SEPARATE native bridge dir, which
         # holds the bridge token + MCP config; delete it so secret material does
@@ -13740,6 +13992,15 @@ def create_runner_app(
             and not credential_bridge.owns_turn(conv_id, credential_turn_id)
         ):
             return
+        if (
+            model_credential_provider is not None
+            and credential_turn_id is not None
+            and (
+                (active_model_turn := _model_credential_turns.get(conv_id)) is None
+                or active_model_turn[0] != credential_turn_id
+            )
+        ):
+            return
         _active_turns.pop(conv_id, None)
         # Native proxy streams end after input injection; their terminal
         # forwarders own the actual turn boundary and clear on idle/failed.
@@ -13750,6 +14011,13 @@ def create_runner_app(
             and not native_turn_continues
         ):
             credential_bridge.clear_turn(conv_id, turn_id=credential_turn_id)
+        if (
+            credential_turn_id is not None
+            and not native_turn_continues
+            and (active_model_turn := _model_credential_turns.get(conv_id)) is not None
+            and active_model_turn[0] == credential_turn_id
+        ):
+            _model_credential_turns.pop(conv_id, None)
         # Turn ended: clear the live marker so a concurrent forward is skipped.
         _live_response_id.pop(conv_id, None)
         # Mirror the clear onto the process manager's in-flight map so the
@@ -14006,8 +14274,13 @@ def create_runner_app(
             # Reserve before the await so a concurrent POST sees an active turn.
             _active_turns[session_id] = None
             _publish_turn_status(session_id, "running")
+            credential_turn_id = _bind_credential_turn(
+                session_id,
+                validate_actor_context(next_body.get("actor")),
+                next_body.get("persisted_item_id"),
+            )
             _turn_task = asyncio.create_task(
-                _run_turn_bg(next_body, session_id),
+                _run_turn_bg(next_body, session_id, credential_turn_id),
                 name=f"turn-cont-{session_id}",
             )
             _active_turns[session_id] = _turn_task
@@ -14390,6 +14663,7 @@ def create_runner_app(
     async def _run_turn_bg(
         msg_body: dict[str, Any],
         conv: str,
+        credential_turn_id: str | None,
     ) -> None:
         """
         Run one session turn in the background.
@@ -14419,7 +14693,7 @@ def create_runner_app(
         # human manually nudges the parent.
         _subagent_wake_pending.discard(conv)
         try:
-            await _run_turn_bg_setup_and_stream(msg_body, conv)
+            await _run_turn_bg_setup_and_stream(msg_body, conv, credential_turn_id)
         except asyncio.CancelledError as exc:
             # Task cancellation (e.g. event-loop teardown) must still
             # publish a terminal ``failed`` status so the session never
@@ -14430,9 +14704,6 @@ def create_runner_app(
                 conv,
                 exc,
                 exc_info=True,
-            )
-            credential_turn_id = (
-                credential_bridge.active_turn_id(conv) if credential_bridge is not None else None
             )
             _on_proxy_stream_end(
                 conv,
@@ -14454,9 +14725,6 @@ def create_runner_app(
                 exc,
                 exc_info=True,
             )
-            credential_turn_id = (
-                credential_bridge.active_turn_id(conv) if credential_bridge is not None else None
-            )
             _on_proxy_stream_end(
                 conv,
                 error={"message": f"turn setup failed: {exc}"},
@@ -14466,6 +14734,7 @@ def create_runner_app(
     async def _run_turn_bg_setup_and_stream(
         msg_body: dict[str, Any],
         conv: str,
+        credential_turn_id: str | None,
     ) -> None:
         """
         Resolve the spec, build the dispatch context, and stream one turn.
@@ -14636,11 +14905,7 @@ def create_runner_app(
             instructions=instructions,
             actor=validate_actor_context(msg_body.get("actor")),
         )
-        ctx.turn_id = _bind_credential_turn(
-            conv,
-            ctx.actor,
-            msg_body.get("persisted_item_id"),
-        )
+        ctx.turn_id = credential_turn_id
 
         harness_body: dict[str, Any] = {
             "type": "message",
@@ -14769,7 +15034,11 @@ def create_runner_app(
         # arrives without a client handshake (sub-agent / API forward) injects
         # into a dead tmux target and the message is lost. No-op for SDK harnesses
         # and when the pane is already live; resumes via the vendor ``--resume``.
-        await _ensure_native_terminal_for_turn(conv, harness_name)
+        if not (
+            model_credential_provider is not None
+            and harness_name in {"claude-native", "codex-native"}
+        ):
+            await _ensure_native_terminal_for_turn(conv, harness_name)
 
         startup_envelope = _fresh_session_init_envelope(conv)
         startup_labels = startup_envelope.snapshot.labels if startup_envelope is not None else None
@@ -14915,6 +15184,12 @@ def create_runner_app(
             _active_turns.pop(session_id, None)
             if credential_bridge is not None and credential_turn_id is not None:
                 credential_bridge.clear_turn(session_id, turn_id=credential_turn_id)
+            if (
+                credential_turn_id is not None
+                and (active_model_turn := _model_credential_turns.get(session_id)) is not None
+                and active_model_turn[0] == credential_turn_id
+            ):
+                _model_credential_turns.pop(session_id, None)
             _live_response_id.pop(session_id, None)
             _publish_turn_status(session_id, "idle")
             raise
@@ -15126,10 +15401,42 @@ def create_runner_app(
                     finally:
                         _publish_terminal_pending(_publish_event, conv_id, False)
 
+        _turn_actor = dispatch.actor if dispatch is not None else body.get("actor")
+        try:
+            spawn_env, model_credential_env, model_credential_scope = await _with_model_credential(
+                conv_id,
+                harness_name,
+                _turn_actor,
+                credential_turn_id,
+                spawn_env,
+            )
+            await _ensure_actor_native_terminal(
+                conv_id,
+                harness_name,
+                model_credential_env,
+                model_credential_scope,
+                credential_turn_id,
+            )
+        except Exception as exc:  # noqa: BLE001 -- deployment provider boundary
+            _logger.warning(
+                "model credential resolution failed for %s: %s",
+                conv_id,
+                type(exc).__name__,
+            )
+            return JSONResponse(
+                status_code=503,
+                content={
+                    "error": "model_credential_resolution_failed",
+                    "detail": "Failed to resolve model credentials for this turn.",
+                },
+            )
+
         spawn_env = await _with_credential_wrappers(conv_id, spawn_env)
 
         try:
             client = await process_manager.get_client(conv_id, harness_name, env=spawn_env)
+            if model_credential_provider is not None:
+                _assert_current_model_credential_turn(conv_id, credential_turn_id)
         except RuntimeError as exc:
             return JSONResponse(
                 status_code=503,
@@ -15147,7 +15454,6 @@ def create_runner_app(
         _mcp_schemas: list[dict[str, Any]] = []
         _mcp_tool_names: set[str] = set()
         _eager_spec_error: tuple[str, str] | None = None
-        _turn_actor = dispatch.actor if dispatch is not None else body.get("actor")
         if _has_mcp_hint is True and _turn_agent_id:
             # Check both spec caches: agent-keyed (MCP path) and
             # session-keyed (session creation path).
@@ -16050,15 +16356,16 @@ def create_runner_app(
 
                 _publish_turn_status(conversation_id, "running")
 
+                credential_turn_id = _bind_credential_turn(
+                    conversation_id,
+                    actor,
+                    message_body.get("persisted_item_id"),
+                )
+
                 if stream:
                     # Streaming mode: return the SSE body synchronously
                     # so the executor can consume response.created,
                     # dispatch tool calls, and pair results inline.
-                    credential_turn_id = _bind_credential_turn(
-                        conversation_id,
-                        actor,
-                        message_body.get("persisted_item_id"),
-                    )
                     response = await _stream_message_to_harness(
                         message_body,
                         conversation_id,
@@ -16076,7 +16383,7 @@ def create_runner_app(
                 # task. Events flow through GET /stream, not the POST
                 # response body. Return 202 immediately.
                 _turn_task = asyncio.create_task(
-                    _run_turn_bg(message_body, conversation_id),
+                    _run_turn_bg(message_body, conversation_id, credential_turn_id),
                     name=f"turn-{conversation_id}",
                 )
                 _active_turns[conversation_id] = _turn_task
@@ -16172,24 +16479,23 @@ def create_runner_app(
                     allow_history_preview_fallback=False,
                 )
             if status in ("idle", "failed"):
+                if isinstance(forwarded_response_id, str):
+                    mapped_turn_id = _credential_status_turns.pop(
+                        (conversation_id, forwarded_response_id),
+                        None,
+                    )
+                    if not (isinstance(forwarded_turn_id, str) and forwarded_turn_id):
+                        forwarded_turn_id = mapped_turn_id
                 if credential_bridge is not None:
-                    if not (
-                        isinstance(forwarded_turn_id, str) and forwarded_turn_id
-                    ) and isinstance(forwarded_response_id, str):
-                        forwarded_turn_id = _credential_status_turns.pop(
-                            (conversation_id, forwarded_response_id),
-                            None,
-                        )
-                    elif isinstance(forwarded_response_id, str):
-                        _credential_status_turns.pop(
-                            (conversation_id, forwarded_response_id),
-                            None,
-                        )
                     if isinstance(forwarded_turn_id, str) and forwarded_turn_id:
                         credential_bridge.clear_turn(
                             conversation_id,
                             turn_id=forwarded_turn_id,
                         )
+                if isinstance(forwarded_turn_id, str) and forwarded_turn_id:
+                    active_model_turn = _model_credential_turns.get(conversation_id)
+                    if active_model_turn is not None and active_model_turn[0] == forwarded_turn_id:
+                        _model_credential_turns.pop(conversation_id, None)
                 # Rebuild a lost / never-registered work entry from the snapshot
                 # first, so a reconnect-wiped map or a sys_session_create child
                 # still wakes the parent instead of being dropped.
@@ -16810,6 +17116,92 @@ def create_runner_app(
                     }
                 },
             )
+
+        if (
+            model_credential_provider is not None
+            and body.get("ensure_native_terminal")
+            and terminal_name in {"claude", "codex"}
+            and session_key == "main"
+        ):
+            terminal_turn_id: str | None = None
+            try:
+                actor = validate_actor_context(body.get("actor"))
+                if actor is None:
+                    raise ValueError(
+                        "actor is required when model credential brokering is enabled"
+                    )
+                actor_run_as = actor.get("run_as")
+                if not isinstance(actor_run_as, str) or not actor_run_as:
+                    raise ValueError("actor.run_as is required")
+                harness = "claude-native" if terminal_name == "claude" else "codex-native"
+                active_model_turn = _model_credential_turns.get(session_id)
+                if active_model_turn is not None and session_id in _active_turns:
+                    if active_model_turn[1] != actor_run_as:
+                        return JSONResponse(
+                            status_code=409,
+                            content={
+                                "error": {
+                                    "code": "actor_turn_active",
+                                    "message": "A different actor owns the active model turn.",
+                                }
+                            },
+                        )
+                    terminal_turn_id = active_model_turn[0]
+                else:
+                    terminal_turn_id = f"terminal_{uuid.uuid4().hex}"
+                    _model_credential_turns[session_id] = (
+                        terminal_turn_id,
+                        actor_run_as,
+                    )
+                _, credential_env, credential_scope = await _with_model_credential(
+                    session_id,
+                    harness,
+                    actor,
+                    terminal_turn_id,
+                    None,
+                )
+                await _ensure_actor_native_terminal(
+                    session_id,
+                    harness,
+                    credential_env,
+                    credential_scope,
+                    terminal_turn_id,
+                )
+                active_model_turn = _model_credential_turns.get(session_id)
+                if active_model_turn is not None and active_model_turn[0] == terminal_turn_id:
+                    _model_credential_turns.pop(session_id, None)
+            except ValueError as exc:
+                return JSONResponse(
+                    status_code=400,
+                    content={
+                        "error": {
+                            "code": "invalid_actor",
+                            "message": str(exc),
+                        }
+                    },
+                )
+            except Exception as exc:  # noqa: BLE001 -- deployment provider boundary
+                active_model_turn = _model_credential_turns.get(session_id)
+                if (
+                    terminal_turn_id is not None
+                    and active_model_turn is not None
+                    and active_model_turn[0] == terminal_turn_id
+                ):
+                    _model_credential_turns.pop(session_id, None)
+                _logger.warning(
+                    "model credential resolution failed during terminal ensure for %s: %s",
+                    session_id,
+                    type(exc).__name__,
+                )
+                return JSONResponse(
+                    status_code=503,
+                    content={
+                        "error": {
+                            "code": "model_credential_resolution_failed",
+                            "message": "Failed to resolve model credentials for this terminal.",
+                        }
+                    },
+                )
 
         # Resume "ensure" path (see _ensure_claude_terminal_on_runner): the CLI
         # marks the request with ``ensure_native_terminal`` to ask for the full
@@ -19844,8 +20236,9 @@ def create_runner_app(
                         "agent_id": agent_id,
                         "model": agent_id or "",
                     }
+                    credential_turn_id = _bind_credential_turn(session_id, None, None)
                     _turn_task = asyncio.create_task(
-                        _run_turn_bg(msg_body, session_id),
+                        _run_turn_bg(msg_body, session_id, credential_turn_id),
                         name=f"turn-catchup-{session_id}",
                     )
                     _active_turns[session_id] = _turn_task
