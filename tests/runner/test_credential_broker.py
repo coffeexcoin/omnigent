@@ -6,6 +6,7 @@ import asyncio
 import io
 import os
 import subprocess
+import threading
 import time
 from collections.abc import AsyncIterator, Sequence
 from pathlib import Path
@@ -19,8 +20,6 @@ from omnigent.runner import create_runner_app
 from omnigent.runner.credential_broker import (
     BROKER_CAPABILITY_ENV,
     BROKER_ENDPOINT_ENV,
-    REAL_GH_ENV,
-    REAL_GIT_ENV,
     ActiveCredentialTurn,
     CredentialAuditEvent,
     CredentialBrokerBridge,
@@ -48,6 +47,7 @@ class _Provider:
         actor = context.actor.get("run_as", "")
         return CredentialGrant(
             username="x-access-token",
+            actor=context.actor.copy(),
             secret=(f"short-lived-for-{actor}" if request.operation == "credential" else None),
             expires_at=(time.time() + 300 if request.operation == "credential" else None),
             git_user_name=actor.split("@", 1)[0].title(),
@@ -111,8 +111,6 @@ async def test_git_credential_uses_active_actor_and_audits_turn(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     bridge, provider, audit = broker
-    env = bridge.wrapper_environment("conv_1", {"PATH": os.environ["PATH"]})
-    _install_env(monkeypatch, env)
     bridge.bind_turn(
         ActiveCredentialTurn(
             session_id="conv_1",
@@ -120,6 +118,8 @@ async def test_git_credential_uses_active_actor_and_audits_turn(
             actor={"run_as": "alice@example.com"},
         )
     )
+    env = bridge.wrapper_environment("conv_1", {"PATH": os.environ["PATH"]})
+    _install_env(monkeypatch, env)
     stdin = io.StringIO(
         "protocol=https\nhost=github.com\npath=acme/repo.git\npassword=must-not-round-trip\n\n"
     )
@@ -162,19 +162,23 @@ async def test_actor_takeover_only_affects_next_bound_turn(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     bridge, provider, _ = broker
+    first = ActiveCredentialTurn("conv_1", "turn_1", {"run_as": "alice@example.com"})
+    second = ActiveCredentialTurn("conv_1", "turn_2", {"run_as": "bob@example.com"})
+    bridge.bind_turn(first)
     _install_env(
         monkeypatch,
         bridge.wrapper_environment("conv_1", {"PATH": os.environ["PATH"]}),
     )
-    first = ActiveCredentialTurn("conv_1", "turn_1", {"run_as": "alice@example.com"})
-    second = ActiveCredentialTurn("conv_1", "turn_2", {"run_as": "bob@example.com"})
-    bridge.bind_turn(first)
     monkeypatch.setattr("sys.stdin", io.StringIO("protocol=https\nhost=github.com\n\n"))
     monkeypatch.setattr("sys.stdout", io.StringIO())
 
     await asyncio.to_thread(run_git_credential, "get")
     bridge.bind_turn(second)
     bridge.clear_turn("conv_1", turn_id="turn_1")
+    _install_env(
+        monkeypatch,
+        bridge.wrapper_environment("conv_1", {"PATH": os.environ["PATH"]}),
+    )
     monkeypatch.setattr("sys.stdin", io.StringIO("protocol=https\nhost=github.com\n\n"))
     monkeypatch.setattr("sys.stdout", io.StringIO())
     await asyncio.to_thread(run_git_credential, "get")
@@ -188,14 +192,14 @@ async def test_git_wrapper_uses_process_local_identity_and_global_config(
     tmp_path: Path,
 ) -> None:
     bridge, _, audit = broker
-    env = bridge.wrapper_environment("conv_1", {"PATH": os.environ["PATH"]})
-    env[REAL_GIT_ENV] = "/usr/bin/git"
-    _install_env(monkeypatch, env)
-    monkeypatch.setenv("GIT_ASKPASS", "/tmp/untrusted-askpass")
-    monkeypatch.setenv("SSH_ASKPASS", "/tmp/untrusted-ssh-askpass")
+    bridge._executables["git"] = "/usr/bin/git"
     bridge.bind_turn(
         ActiveCredentialTurn("conv_1", "turn_commit", {"run_as": "alice@example.com"})
     )
+    env = bridge.wrapper_environment("conv_1", {"PATH": os.environ["PATH"]})
+    _install_env(monkeypatch, env)
+    monkeypatch.setenv("GIT_ASKPASS", "/tmp/untrusted-askpass")
+    monkeypatch.setenv("SSH_ASKPASS", "/tmp/untrusted-ssh-askpass")
     home_config = tmp_path / ".gitconfig"
     home_config.write_text("original\n", encoding="utf-8")
     monkeypatch.setenv("HOME", str(tmp_path))
@@ -234,6 +238,7 @@ async def test_git_wrapper_uses_process_local_identity_and_global_config(
     assert "GIT_ASKPASS" not in captured["env"]
     assert "SSH_ASKPASS" not in captured["env"]
     assert home_config.read_text(encoding="utf-8") == "original\n"
+    assert not Path(captured["env"]["GIT_CONFIG_GLOBAL"]).parent.exists()
     assert audit[0].action == "commit"
     assert audit[0].turn_id == "turn_commit"
 
@@ -245,8 +250,7 @@ async def test_generated_git_wrapper_executes_real_git(
     """The generated PATH entry is executable, not only a unit-level shim."""
 
     bridge, _, audit = broker
-    env_updates = bridge.wrapper_environment("conv_real_git", os.environ)
-    real_git = env_updates.get(REAL_GIT_ENV)
+    real_git = bridge._executables.get("git")
     if real_git is None:
         pytest.skip("git is not installed")
     subprocess.run(
@@ -261,6 +265,7 @@ async def test_generated_git_wrapper_executes_real_git(
             {"run_as": "alice@example.com"},
         )
     )
+    env_updates = bridge.wrapper_environment("conv_real_git", os.environ)
     env = dict(os.environ)
     env.update(env_updates)
 
@@ -286,14 +291,14 @@ async def test_gh_wrapper_scopes_token_and_config_to_child_process(
     tmp_path: Path,
 ) -> None:
     bridge, _, audit = broker
+    bridge._executables["gh"] = "/usr/bin/gh"
+    bridge.bind_turn(ActiveCredentialTurn("conv_1", "turn_pr", {"run_as": "bob@example.com"}))
     env = bridge.wrapper_environment("conv_1", {"PATH": os.environ["PATH"]})
-    env[REAL_GH_ENV] = "/usr/bin/gh"
     _install_env(monkeypatch, env)
     monkeypatch.setenv("GH_TOKEN", "stale-token")
     monkeypatch.setenv("GITHUB_TOKEN", "also-stale")
     monkeypatch.setenv("GH_ENTERPRISE_TOKEN", "stale-enterprise-token")
     monkeypatch.setenv("HOME", str(tmp_path))
-    bridge.bind_turn(ActiveCredentialTurn("conv_1", "turn_pr", {"run_as": "bob@example.com"}))
     captured: dict[str, Any] = {}
 
     def fake_run(
@@ -323,6 +328,7 @@ async def test_gh_wrapper_scopes_token_and_config_to_child_process(
     assert "GITHUB_TOKEN" not in captured["env"]
     assert "GH_ENTERPRISE_TOKEN" not in captured["env"]
     assert not (tmp_path / ".config" / "gh").exists()
+    assert not Path(captured["env"]["GH_CONFIG_DIR"]).exists()
     assert audit[0].session_id == "conv_1"
     assert audit[0].turn_id == "turn_pr"
     assert audit[0].actor == {"run_as": "bob@example.com"}
@@ -449,3 +455,245 @@ async def test_native_runner_keeps_actor_bound_until_forwarded_idle(
     assert audit[0].session_id == conversation_id
     assert audit[0].turn_id == "item_turn_42"
     assert audit[0].actor == {"run_as": "alice@example.com"}
+
+
+async def test_wrapper_environment_does_not_trust_real_executable_overrides(
+    broker: tuple[CredentialBrokerBridge, _Provider, list[CredentialAuditEvent]],
+) -> None:
+    bridge, _, _ = broker
+
+    env = bridge.wrapper_environment("conv_1", {"PATH": os.environ["PATH"]})
+
+    assert not any(key.startswith("OMNIGENT_REAL_") for key in env)
+
+
+async def test_stale_actor_capability_cannot_borrow_takeover_credentials(
+    broker: tuple[CredentialBrokerBridge, _Provider, list[CredentialAuditEvent]],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    bridge, provider, _ = broker
+    first = ActiveCredentialTurn("conv_1", "turn_1", {"run_as": "alice@example.com"})
+    second = ActiveCredentialTurn("conv_1", "turn_2", {"run_as": "bob@example.com"})
+    bridge.bind_turn(first)
+    old_env = bridge.wrapper_environment("conv_1", {"PATH": os.environ["PATH"]})
+    _install_env(monkeypatch, old_env)
+    monkeypatch.setattr("sys.stdin", io.StringIO("protocol=https\nhost=github.com\n\n"))
+    monkeypatch.setattr("sys.stdout", io.StringIO())
+    await asyncio.to_thread(run_git_credential, "get")
+
+    bridge.bind_turn(second)
+    monkeypatch.setattr("sys.stdin", io.StringIO("protocol=https\nhost=github.com\n\n"))
+    monkeypatch.setattr("sys.stdout", io.StringIO())
+    with pytest.raises(RuntimeError, match="origin actor"):
+        await asyncio.to_thread(run_git_credential, "get")
+
+    assert [call[0] for call in provider.calls] == [first]
+
+
+async def test_actorless_capability_cannot_adopt_a_later_turn_actor(
+    broker: tuple[CredentialBrokerBridge, _Provider, list[CredentialAuditEvent]],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    bridge, provider, audit = broker
+    old_env = bridge.wrapper_environment("conv_1", {"PATH": os.environ["PATH"]})
+    bridge.bind_turn(ActiveCredentialTurn("conv_1", "turn_1", {"run_as": "alice@example.com"}))
+    assert bridge.requires_process_rotation("conv_1") is True
+    _install_env(monkeypatch, old_env)
+    monkeypatch.setattr("sys.stdin", io.StringIO("protocol=https\nhost=github.com\n\n"))
+
+    with pytest.raises(RuntimeError, match="origin actor"):
+        await asyncio.to_thread(run_git_credential, "get")
+
+    assert provider.calls == []
+    assert audit == []
+
+
+@pytest.mark.parametrize(
+    "grant_actor",
+    [None, {"run_as": "mallory@example.com"}],
+    ids=["missing", "mismatched"],
+)
+async def test_provider_grant_actor_must_match_active_turn(
+    grant_actor: dict[str, str] | None,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    class _WrongActorProvider:
+        async def issue(
+            self, context: ActiveCredentialTurn, request: CredentialRequest
+        ) -> CredentialGrant:
+            del context, request
+            return CredentialGrant(
+                username="x-access-token",
+                actor=grant_actor,  # type: ignore[arg-type]
+                git_user_name="Alice",
+                git_user_email="alice@example.com",
+            )
+
+    audit: list[CredentialAuditEvent] = []
+    bridge = CredentialBrokerBridge(_WrongActorProvider(), audit_sink=audit.append)
+    await bridge.start()
+    try:
+        turn = ActiveCredentialTurn(
+            "conv_wrong_actor",
+            "turn_wrong_actor",
+            {"run_as": "alice@example.com"},
+        )
+        bridge.bind_turn(turn)
+        _install_env(
+            monkeypatch,
+            bridge.wrapper_environment("conv_wrong_actor", {"PATH": os.environ["PATH"]}),
+        )
+        monkeypatch.setattr(
+            subprocess,
+            "run",
+            lambda *args, **kwargs: pytest.fail("Git must not run for an invalid actor grant"),
+        )
+
+        with pytest.raises(RuntimeError, match="credential broker request failed"):
+            await asyncio.to_thread(run_git, ["status"])
+    finally:
+        await bridge.close()
+
+    assert audit == [
+        CredentialAuditEvent(
+            session_id=turn.session_id,
+            turn_id=turn.turn_id,
+            actor=turn.actor,
+            tool="git",
+            action="status",
+            operation="identity",
+            outcome="error",
+        )
+    ]
+
+
+async def test_provider_exception_is_secret_safe_over_the_broker_boundary(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    leaked_secret = "provider-secret-must-not-cross-boundary"
+
+    class _FailingProvider:
+        async def issue(
+            self, context: ActiveCredentialTurn, request: CredentialRequest
+        ) -> CredentialGrant:
+            del context, request
+            raise RuntimeError(leaked_secret)
+
+    audit: list[CredentialAuditEvent] = []
+    bridge = CredentialBrokerBridge(_FailingProvider(), audit_sink=audit.append)
+    await bridge.start()
+    try:
+        turn = ActiveCredentialTurn(
+            "conv_provider_error",
+            "turn_provider_error",
+            {"run_as": "alice@example.com"},
+        )
+        bridge.bind_turn(turn)
+        _install_env(
+            monkeypatch,
+            bridge.wrapper_environment("conv_provider_error", {"PATH": os.environ["PATH"]}),
+        )
+
+        with pytest.raises(RuntimeError) as error:
+            await asyncio.to_thread(
+                _broker_request,
+                {"tool": "git", "operation": "identity", "action": "status"},
+            )
+    finally:
+        await bridge.close()
+
+    assert leaked_secret not in str(error.value)
+    assert leaked_secret not in repr(audit)
+    assert audit[0].outcome == "error"
+    assert audit[0].actor == turn.actor
+
+
+@pytest.mark.parametrize("argv", [["auth", "token"], ["extension", "exec", "untrusted"]])
+async def test_gh_secret_revealing_commands_fail_before_requesting_a_credential(
+    argv: list[str],
+    broker: tuple[CredentialBrokerBridge, _Provider, list[CredentialAuditEvent]],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    bridge, provider, audit = broker
+    _install_env(
+        monkeypatch,
+        bridge.wrapper_environment("conv_1", {"PATH": os.environ["PATH"]}),
+    )
+
+    with pytest.raises(PermissionError, match=r"gh (auth|extension)"):
+        await asyncio.to_thread(run_gh, argv)
+
+    assert provider.calls == []
+    assert audit == []
+
+
+async def test_provider_timeout_fails_closed() -> None:
+    class _HangingProvider:
+        async def issue(
+            self, context: ActiveCredentialTurn, request: CredentialRequest
+        ) -> CredentialGrant:
+            del context, request
+            await asyncio.Event().wait()
+            raise AssertionError("unreachable")
+
+    bridge = CredentialBrokerBridge(_HangingProvider(), provider_timeout=0.01)
+    await bridge.start()
+    try:
+        bridge.bind_turn(
+            ActiveCredentialTurn("conv_timeout", "turn_timeout", {"run_as": "alice@example.com"})
+        )
+        env = bridge.wrapper_environment("conv_timeout", {"PATH": os.environ["PATH"]})
+        payload = {
+            "capability": env[BROKER_CAPABILITY_ENV],
+            "tool": "git",
+            "operation": "identity",
+            "action": "status",
+        }
+
+        with pytest.raises(RuntimeError, match="provider failed"):
+            await bridge._dispatch(payload)
+    finally:
+        await bridge.close()
+
+
+async def test_concurrent_git_invocations_use_isolated_ephemeral_config(
+    broker: tuple[CredentialBrokerBridge, _Provider, list[CredentialAuditEvent]],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    bridge, _, _ = broker
+    bridge._executables["git"] = "/usr/bin/git"
+    bridge.bind_turn(
+        ActiveCredentialTurn(
+            "conv_concurrent",
+            "turn_concurrent",
+            {"run_as": "alice@example.com"},
+        )
+    )
+    _install_env(
+        monkeypatch,
+        bridge.wrapper_environment("conv_concurrent", {"PATH": os.environ["PATH"]}),
+    )
+    barrier = threading.Barrier(2)
+    config_dirs: list[Path] = []
+    config_dirs_lock = threading.Lock()
+
+    def fake_run(
+        command: Sequence[str], *, env: dict[str, str], check: bool
+    ) -> subprocess.CompletedProcess[str]:
+        config_dir = Path(env["GIT_CONFIG_GLOBAL"]).parent
+        with config_dirs_lock:
+            config_dirs.append(config_dir)
+        barrier.wait(timeout=5)
+        assert config_dir.exists()
+        return subprocess.CompletedProcess(command, 0)
+
+    monkeypatch.setattr(subprocess, "run", fake_run)
+
+    results = await asyncio.gather(
+        asyncio.to_thread(run_git, ["status", "--short"]),
+        asyncio.to_thread(run_git, ["status", "--short"]),
+    )
+
+    assert results == [0, 0]
+    assert len(set(config_dirs)) == 2
+    assert all(not config_dir.exists() for config_dir in config_dirs)

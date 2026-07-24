@@ -7092,6 +7092,7 @@ class TurnDispatch:
         to tunnel rather than dispatching them locally.
     :param actor: Authenticated actor pinned to this turn. Tool calls and
         policy evaluations carry this value back through the server.
+    :param turn_id: Stable turn identifier used to fence credential cleanup.
     """
 
     agent_id: str | None = None
@@ -7102,6 +7103,7 @@ class TurnDispatch:
     spawn_env: dict[str, str] | None = None
     client_side_tool_names: frozenset[str] = frozenset()
     actor: ActorContext | None = None
+    turn_id: str | None = None
 
 
 def _wrap_as_message_event(body: dict[str, Any]) -> dict[str, Any]:
@@ -8265,6 +8267,8 @@ def create_runner_app(
     ) -> dict[str, str] | None:
         if credential_bridge is None:
             return spawn_env
+        if credential_bridge.requires_process_rotation(session_id) and process_manager is not None:
+            await process_manager.release(session_id)
         wrapped = dict(spawn_env or {})
         wrapped.update(await _credential_wrapper_environment(session_id, spawn_env))
         return wrapped
@@ -8273,12 +8277,12 @@ def create_runner_app(
         session_id: str,
         actor: ActorContext | None,
         raw_turn_id: object,
-    ) -> None:
+    ) -> str | None:
         if credential_bridge is None:
-            return
+            return None
         if actor is None:
             credential_bridge.clear_turn(session_id)
-            return
+            return None
         from omnigent.runner.credential_broker import ActiveCredentialTurn
 
         turn_id = (
@@ -8293,6 +8297,7 @@ def create_runner_app(
                 actor=actor.copy(),
             )
         )
+        return turn_id
 
     # Runner-side auth middleware.
     if auth_token is not None:
@@ -13695,6 +13700,7 @@ def create_runner_app(
         conv_id: str,
         *,
         error: dict[str, Any] | None = None,
+        credential_turn_id: str | None = None,
     ) -> None:
         """
         Turn-end bookkeeping called from proxy_stream completion points.
@@ -13720,14 +13726,26 @@ def create_runner_app(
         :param error: If the turn ended due to an error, a dict
             with at least a ``"message"`` key. ``None`` for
             successful completion.
+        :param credential_turn_id: Expected broker turn. A stale completion
+            cannot clear credentials already rebound to a successor.
         """
 
+        if (
+            credential_bridge is not None
+            and credential_turn_id is not None
+            and not credential_bridge.owns_turn(conv_id, credential_turn_id)
+        ):
+            return
         _active_turns.pop(conv_id, None)
         # Native proxy streams end after input injection; their terminal
         # forwarders own the actual turn boundary and clear on idle/failed.
         native_turn_continues = error is None and _is_native_harness(conv_id)
-        if credential_bridge is not None and not native_turn_continues:
-            credential_bridge.clear_turn(conv_id)
+        if (
+            credential_bridge is not None
+            and credential_turn_id is not None
+            and not native_turn_continues
+        ):
+            credential_bridge.clear_turn(conv_id, turn_id=credential_turn_id)
         # Turn ended: clear the live marker so a concurrent forward is skipped.
         _live_response_id.pop(conv_id, None)
         # Mirror the clear onto the process manager's in-flight map so the
@@ -13854,7 +13872,15 @@ def create_runner_app(
             # pops _active_turns, publishes idle (or starts a buffered
             # continuation), and runs the interrupted path (flag-discard +
             # cancellation items) itself, so skip the block below.
-            _on_proxy_stream_end(conv_id)
+            credential_turn_id = (
+                credential_bridge.active_turn_id(conv_id)
+                if credential_bridge is not None
+                else None
+            )
+            _on_proxy_stream_end(
+                conv_id,
+                credential_turn_id=credential_turn_id,
+            )
             return True
         if conv_id in _interrupted_sessions:
             _interrupted_sessions.discard(conv_id)
@@ -14401,7 +14427,14 @@ def create_runner_app(
                 exc,
                 exc_info=True,
             )
-            _on_proxy_stream_end(conv, error={"message": f"turn setup failed: {exc}"})
+            credential_turn_id = (
+                credential_bridge.active_turn_id(conv) if credential_bridge is not None else None
+            )
+            _on_proxy_stream_end(
+                conv,
+                error={"message": f"turn setup failed: {exc}"},
+                credential_turn_id=credential_turn_id,
+            )
             raise
         except Exception as exc:
             # Any failure before the harness stream starts (e.g. a provider
@@ -14417,7 +14450,14 @@ def create_runner_app(
                 exc,
                 exc_info=True,
             )
-            _on_proxy_stream_end(conv, error={"message": f"turn setup failed: {exc}"})
+            credential_turn_id = (
+                credential_bridge.active_turn_id(conv) if credential_bridge is not None else None
+            )
+            _on_proxy_stream_end(
+                conv,
+                error={"message": f"turn setup failed: {exc}"},
+                credential_turn_id=credential_turn_id,
+            )
 
     async def _run_turn_bg_setup_and_stream(
         msg_body: dict[str, Any],
@@ -14592,7 +14632,11 @@ def create_runner_app(
             instructions=instructions,
             actor=validate_actor_context(msg_body.get("actor")),
         )
-        _bind_credential_turn(conv, ctx.actor, msg_body.get("persisted_item_id"))
+        ctx.turn_id = _bind_credential_turn(
+            conv,
+            ctx.actor,
+            msg_body.get("persisted_item_id"),
+        )
 
         harness_body: dict[str, Any] = {
             "type": "message",
@@ -14816,7 +14860,7 @@ def create_runner_app(
         finally:
             _session_init_envelopes.pop(conv, None)
         if isinstance(response, StreamingResponse):
-            await _drain_streaming_response(response, conv)
+            await _drain_streaming_response(response, conv, ctx.turn_id)
         else:
             err_detail = "harness returned error response"
             if hasattr(response, "body"):
@@ -14835,11 +14879,13 @@ def create_runner_app(
             _on_proxy_stream_end(
                 conv,
                 error={"message": err_detail},
+                credential_turn_id=ctx.turn_id,
             )
 
     async def _drain_streaming_response(
         response: StreamingResponse,
         session_id: str,
+        credential_turn_id: str | None,
     ) -> None:
         """
         Consume a background turn's ``StreamingResponse`` to completion.
@@ -14863,8 +14909,8 @@ def create_runner_app(
             # This teardown bypasses _on_proxy_stream_end, so clear the live
             # marker here too or the next turn's forward gate goes stale.
             _active_turns.pop(session_id, None)
-            if credential_bridge is not None:
-                credential_bridge.clear_turn(session_id)
+            if credential_bridge is not None and credential_turn_id is not None:
+                credential_bridge.clear_turn(session_id, turn_id=credential_turn_id)
             _live_response_id.pop(session_id, None)
             _publish_turn_status(session_id, "idle")
             raise
@@ -14880,12 +14926,14 @@ def create_runner_app(
                 error={
                     "message": f"background turn drain failed: {exc}",
                 },
+                credential_turn_id=credential_turn_id,
             )
 
     async def _stream_message_to_harness(
         body: dict[str, Any],
         conv_id: str,
         dispatch: TurnDispatch | None = None,
+        credential_turn_id: str | None = None,
     ) -> Any:
         """Stream one session message through the runner-owned harness.
 
@@ -14902,6 +14950,8 @@ def create_runner_app(
         # to body fields for legacy callers.
         harness_name = dispatch.harness if dispatch else body.get("harness")
         spawn_env = dispatch.spawn_env if dispatch else body.get("spawn_env")
+        if dispatch is not None:
+            credential_turn_id = dispatch.turn_id
         startup_envelope = _fresh_session_init_envelope(conv_id)
         startup_labels = startup_envelope.snapshot.labels if startup_envelope is not None else None
         if not harness_name:
@@ -15215,6 +15265,7 @@ def create_runner_app(
                 _on_proxy_stream_end(
                     conv_id,
                     error={"message": _err_msg, "type": _err_type},
+                    credential_turn_id=credential_turn_id,
                 )
                 yield _response_failed_event({"message": _err_msg, "type": _err_type})
                 return
@@ -15242,6 +15293,7 @@ def create_runner_app(
                         _on_proxy_stream_end(
                             conv_id,
                             error={"status": harness_resp.status_code},
+                            credential_turn_id=credential_turn_id,
                         )
                         yield _response_failed_event({"status": harness_resp.status_code})
                         return
@@ -15516,6 +15568,7 @@ def create_runner_app(
                                                     "message": _err_msg,
                                                     "type": _err_type,
                                                 },
+                                                credential_turn_id=credential_turn_id,
                                             )
                                             yield _response_failed_event(
                                                 {"message": _err_msg, "type": _err_type}
@@ -15630,7 +15683,11 @@ def create_runner_app(
                     if _dispatch_tasks:
                         await _asyncio.gather(*_dispatch_tasks, return_exceptions=True)
 
-                    _on_proxy_stream_end(conv_id, error=_stream_failed_error)
+                    _on_proxy_stream_end(
+                        conv_id,
+                        error=_stream_failed_error,
+                        credential_turn_id=credential_turn_id,
+                    )
 
             except _ContextWindowOverflow as overflow:
                 # Handled here, not by the callers of proxy_stream, so the
@@ -15652,7 +15709,11 @@ def create_runner_app(
                     "error": _error,
                 }
                 _publish_event(conv_id, _overflow_fail)
-                _on_proxy_stream_end(conv_id, error=_error)
+                _on_proxy_stream_end(
+                    conv_id,
+                    error=_error,
+                    credential_turn_id=credential_turn_id,
+                )
                 yield _response_failed_event(_error)
 
             except (httpx.HTTPError, RuntimeError) as exc:
@@ -15685,7 +15746,11 @@ def create_runner_app(
                     "error": _error,
                 }
                 _publish_event(conv_id, _http_fail)
-                _on_proxy_stream_end(conv_id, error=_error)
+                _on_proxy_stream_end(
+                    conv_id,
+                    error=_error,
+                    credential_turn_id=credential_turn_id,
+                )
                 yield _response_failed_event(_error)
 
         return StreamingResponse(
@@ -15977,16 +16042,21 @@ def create_runner_app(
                     # Streaming mode: return the SSE body synchronously
                     # so the executor can consume response.created,
                     # dispatch tool calls, and pair results inline.
-                    _bind_credential_turn(
+                    credential_turn_id = _bind_credential_turn(
                         conversation_id,
                         actor,
                         message_body.get("persisted_item_id"),
                     )
-                    response = await _stream_message_to_harness(message_body, conversation_id)
+                    response = await _stream_message_to_harness(
+                        message_body,
+                        conversation_id,
+                        credential_turn_id=credential_turn_id,
+                    )
                     if not isinstance(response, StreamingResponse):
                         _on_proxy_stream_end(
                             conversation_id,
                             error={"message": "harness returned error response"},
+                            credential_turn_id=credential_turn_id,
                         )
                     return response
 
@@ -16078,7 +16148,17 @@ def create_runner_app(
                 )
             if status in ("idle", "failed"):
                 if credential_bridge is not None:
-                    credential_bridge.clear_turn(conversation_id)
+                    forwarded_turn_id = data.get("turn_id") if isinstance(data, dict) else None
+                    expected_turn_id = (
+                        forwarded_turn_id
+                        if isinstance(forwarded_turn_id, str) and forwarded_turn_id
+                        else credential_bridge.active_turn_id(conversation_id)
+                    )
+                    if expected_turn_id is not None:
+                        credential_bridge.clear_turn(
+                            conversation_id,
+                            turn_id=expected_turn_id,
+                        )
                 # Rebuild a lost / never-registered work entry from the snapshot
                 # first, so a reconnect-wiped map or a sys_session_create child
                 # still wakes the parent instead of being dropped.

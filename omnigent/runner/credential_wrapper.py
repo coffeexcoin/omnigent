@@ -15,9 +15,9 @@ from pathlib import Path
 from omnigent.runner.credential_broker import (
     BROKER_CAPABILITY_ENV,
     BROKER_ENDPOINT_ENV,
-    REAL_GH_ENV,
-    REAL_GIT_ENV,
 )
+
+_DENIED_GH_ACTIONS = frozenset({"auth", "extension"})
 
 
 def _broker_request(payload: Mapping[str, object]) -> dict[str, object]:
@@ -44,10 +44,30 @@ def _broker_request(payload: Mapping[str, object]) -> dict[str, object]:
     if not isinstance(response, dict) or response.get("ok") is not True:
         detail = response.get("error") if isinstance(response, dict) else None
         raise RuntimeError(str(detail or "credential broker denied the request"))
+    if not isinstance(response.get("grant"), dict):
+        raise RuntimeError("credential broker returned no grant")
+    return response
+
+
+def _grant_from_response(response: Mapping[str, object]) -> dict[str, object]:
     grant = response.get("grant")
     if not isinstance(grant, dict):
         raise RuntimeError("credential broker returned no grant")
     return grant
+
+
+def _executable_from_response(response: Mapping[str, object], tool: str) -> str:
+    executable = response.get("executable")
+    if not isinstance(executable, str) or not executable:
+        raise RuntimeError(f"real {tool} executable is unavailable")
+    return executable
+
+
+def _artifact_dir_from_response(response: Mapping[str, object]) -> str:
+    artifact_dir = response.get("artifact_dir")
+    if not isinstance(artifact_dir, str) or not artifact_dir:
+        raise RuntimeError("credential broker returned no invocation directory")
+    return artifact_dir
 
 
 def _gh_action(argv: Sequence[str]) -> str:
@@ -102,16 +122,16 @@ def _git_action(argv: Sequence[str]) -> str:
 def run_git(argv: Sequence[str]) -> int:
     """Execute real Git with brokered identity and a process-local helper."""
 
-    real_git = os.environ.get(REAL_GIT_ENV)
-    if not real_git:
-        raise RuntimeError("real git executable is unavailable")
-    grant = _broker_request(
+    response = _broker_request(
         {
             "tool": "git",
             "operation": "identity",
             "action": _git_action(argv),
         }
     )
+    real_git = _executable_from_response(response, "git")
+    artifact_dir = _artifact_dir_from_response(response)
+    grant = _grant_from_response(response)
     name = grant.get("git_user_name")
     email = grant.get("git_user_email")
     if not isinstance(name, str) or not name or not isinstance(email, str) or not email:
@@ -119,7 +139,10 @@ def run_git(argv: Sequence[str]) -> int:
 
     helper = f"!{shlex.quote(sys.executable)} -m omnigent.runner.credential_wrapper git-credential"
     deny_ssh = f"{shlex.quote(sys.executable)} -m omnigent.runner.credential_wrapper deny-ssh"
-    with tempfile.TemporaryDirectory(prefix="omnigent-git-config-") as config_dir:
+    with tempfile.TemporaryDirectory(
+        prefix="git-",
+        dir=artifact_dir,
+    ) as config_dir:
         global_config = Path(config_dir) / "config"
         global_config.touch(mode=0o600)
         env = dict(os.environ)
@@ -170,7 +193,7 @@ def run_git_credential(operation: str) -> int:
     if operation not in ("get", "store", "erase"):
         raise RuntimeError(f"unsupported git credential operation: {operation}")
     fields = _read_git_credential_input()
-    grant = _broker_request(
+    response = _broker_request(
         {
             "tool": "git",
             "operation": "credential",
@@ -180,6 +203,7 @@ def run_git_credential(operation: str) -> int:
             "path": fields.get("path"),
         }
     )
+    grant = _grant_from_response(response)
     if operation != "get":
         return 0
     username = grant.get("username")
@@ -193,23 +217,29 @@ def run_git_credential(operation: str) -> int:
 def run_gh(argv: Sequence[str]) -> int:
     """Execute real gh with a per-invocation token and isolated config dir."""
 
-    real_gh = os.environ.get(REAL_GH_ENV)
-    if not real_gh:
-        raise RuntimeError("real gh executable is unavailable")
+    action = _gh_action(argv)
+    if action in _DENIED_GH_ACTIONS:
+        raise PermissionError(f"gh {action} commands are unavailable with brokered credentials")
     host = os.environ.get("GH_HOST", "github.com")
-    grant = _broker_request(
+    response = _broker_request(
         {
             "tool": "gh",
             "operation": "credential",
-            "action": _gh_action(argv),
+            "action": action,
             "host": host,
         }
     )
+    real_gh = _executable_from_response(response, "gh")
+    artifact_dir = _artifact_dir_from_response(response)
+    grant = _grant_from_response(response)
     secret = grant.get("secret")
     if not isinstance(secret, str) or not secret:
         raise RuntimeError("credential broker returned no GitHub token")
 
-    with tempfile.TemporaryDirectory(prefix="omnigent-gh-config-") as config_dir:
+    with tempfile.TemporaryDirectory(
+        prefix="gh-",
+        dir=artifact_dir,
+    ) as config_dir:
         env = dict(os.environ)
         env.pop("GITHUB_TOKEN", None)
         env.pop("GH_TOKEN", None)

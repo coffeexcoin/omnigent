@@ -1,9 +1,10 @@
 """Process-local credential broker for Git and GitHub CLI wrappers.
 
 The trusted runner owns this bridge. Agent subprocesses receive only an opaque
-session capability and a loopback endpoint; they never receive actor identity
-in their environment. Each request is rebound to the currently active turn
-before an addon credential provider is called.
+actor-scoped capability and a loopback endpoint; they never receive actor
+identity, credentials, or trusted executable paths in their environment. Each
+request is rebound to the currently active turn before an addon credential
+provider is called.
 """
 
 from __future__ import annotations
@@ -29,11 +30,10 @@ from omnigent.policies.schema import ActorContext
 
 BROKER_ENDPOINT_ENV = "OMNIGENT_CREDENTIAL_BROKER_ENDPOINT"
 BROKER_CAPABILITY_ENV = "OMNIGENT_CREDENTIAL_BROKER_CAPABILITY"
-REAL_GIT_ENV = "OMNIGENT_REAL_GIT"
-REAL_GH_ENV = "OMNIGENT_REAL_GH"
 WRAPPER_PYTHON_ENV = "OMNIGENT_CREDENTIAL_WRAPPER_PYTHON"
 _MAX_REQUEST_BYTES = 64 * 1024
 _MAX_CREDENTIAL_TTL_SECONDS = 15 * 60
+_DEFAULT_PROVIDER_TIMEOUT_SECONDS = 10.0
 _logger = logging.getLogger(__name__)
 
 
@@ -63,6 +63,7 @@ class CredentialGrant:
     """Short-lived provider response. Secret values are excluded from repr."""
 
     username: str
+    actor: ActorContext | None = None
     secret: str | None = field(default=None, repr=False)
     expires_at: float | None = None
     git_user_name: str | None = None
@@ -93,6 +94,14 @@ class CredentialProvider(Protocol):
 AuditSink = Callable[[CredentialAuditEvent], Awaitable[None] | None]
 
 
+@dataclass(frozen=True)
+class _CapabilityBinding:
+    """Principal that originally received one opaque subprocess capability."""
+
+    session_id: str
+    actor: ActorContext | None
+
+
 class CredentialBrokerBridge:
     """Loopback broker binding opaque session capabilities to active turns."""
 
@@ -102,17 +111,27 @@ class CredentialBrokerBridge:
         *,
         audit_sink: AuditSink | None = None,
         wrapper_dir: Path | None = None,
+        provider_timeout: float = _DEFAULT_PROVIDER_TIMEOUT_SECONDS,
     ) -> None:
+        if provider_timeout <= 0:
+            raise ValueError("provider_timeout must be positive")
         self._provider = provider
         self._audit_sink = audit_sink
+        self._provider_timeout = provider_timeout
         self._active_turns: dict[str, ActiveCredentialTurn] = {}
         self._session_capabilities: dict[str, str] = {}
-        self._capability_sessions: dict[str, str] = {}
+        self._capability_bindings: dict[str, _CapabilityBinding] = {}
+        self._executables = {
+            tool: executable
+            for tool in ("git", "gh")
+            if (executable := shutil.which(tool)) is not None
+        }
         self._server: asyncio.AbstractServer | None = None
         self._endpoint: str | None = None
         self._start_lock = asyncio.Lock()
         self._owned_wrapper_dir = wrapper_dir is None
         self._wrapper_dir = wrapper_dir or Path(tempfile.mkdtemp(prefix="omnigent-vcs-wrappers-"))
+        self._artifact_dir = self._wrapper_dir / "invocations"
 
     @property
     def endpoint(self) -> str | None:
@@ -144,9 +163,11 @@ class CredentialBrokerBridge:
         self._endpoint = None
         self._active_turns.clear()
         self._session_capabilities.clear()
-        self._capability_sessions.clear()
+        self._capability_bindings.clear()
         if self._owned_wrapper_dir:
             shutil.rmtree(self._wrapper_dir, ignore_errors=True)
+        else:
+            shutil.rmtree(self._artifact_dir, ignore_errors=True)
 
     def bind_turn(self, context: ActiveCredentialTurn) -> None:
         """Make *context* authoritative for subsequent session requests."""
@@ -164,6 +185,18 @@ class CredentialBrokerBridge:
         if current is not None and (turn_id is None or current.turn_id == turn_id):
             self._active_turns.pop(session_id, None)
 
+    def active_turn_id(self, session_id: str) -> str | None:
+        """Return the current turn id for compatibility status fencing."""
+
+        current = self._active_turns.get(session_id)
+        return current.turn_id if current is not None else None
+
+    def owns_turn(self, session_id: str, turn_id: str) -> bool:
+        """Return whether *turn_id* is still authoritative for the session."""
+
+        current = self._active_turns.get(session_id)
+        return current is not None and current.turn_id == turn_id
+
     def wrapper_environment(
         self,
         session_id: str,
@@ -173,27 +206,34 @@ class CredentialBrokerBridge:
 
         if self._endpoint is None:
             raise RuntimeError("credential broker bridge is not started")
+        context = self._active_turns.get(session_id)
+        actor = context.actor.copy() if context is not None else None
         capability = self._session_capabilities.get(session_id)
-        if capability is None:
+        binding = self._capability_bindings.get(capability) if capability is not None else None
+        if capability is None or binding is None or binding.actor != actor:
             capability = secrets.token_urlsafe(32)
             self._session_capabilities[session_id] = capability
-            self._capability_sessions[capability] = session_id
+            self._capability_bindings[capability] = _CapabilityBinding(
+                session_id=session_id,
+                actor=actor,
+            )
 
         source = base_env or os.environ
         original_path = source.get("PATH", os.defpath)
-        env = {
+        return {
             "PATH": f"{self._wrapper_dir}{os.pathsep}{original_path}",
             BROKER_ENDPOINT_ENV: self._endpoint,
             BROKER_CAPABILITY_ENV: capability,
             WRAPPER_PYTHON_ENV: sys.executable,
         }
-        real_git = shutil.which("git", path=original_path)
-        real_gh = shutil.which("gh", path=original_path)
-        if real_git is not None:
-            env[REAL_GIT_ENV] = real_git
-        if real_gh is not None:
-            env[REAL_GH_ENV] = real_gh
-        return env
+
+    def requires_process_rotation(self, session_id: str) -> bool:
+        """Return whether the live subprocess capability belongs to another actor."""
+
+        capability = self._session_capabilities.get(session_id)
+        binding = self._capability_bindings.get(capability) if capability is not None else None
+        context = self._active_turns.get(session_id)
+        return binding is not None and context is not None and binding.actor != context.actor
 
     def revoke_session(self, session_id: str) -> None:
         """Revoke a session capability and clear any active turn."""
@@ -201,10 +241,18 @@ class CredentialBrokerBridge:
         self._active_turns.pop(session_id, None)
         capability = self._session_capabilities.pop(session_id, None)
         if capability is not None:
-            self._capability_sessions.pop(capability, None)
+            self._capability_bindings.pop(capability, None)
+        stale_capabilities = [
+            capability
+            for capability, binding in self._capability_bindings.items()
+            if binding.session_id == session_id
+        ]
+        for capability in stale_capabilities:
+            self._capability_bindings.pop(capability, None)
 
     def _write_wrappers(self) -> None:
         self._wrapper_dir.mkdir(parents=True, exist_ok=True)
+        self._artifact_dir.mkdir(mode=0o700, exist_ok=True)
         for tool in ("git", "gh"):
             target = self._wrapper_dir / tool
             target.write_text(
@@ -241,12 +289,15 @@ class CredentialBrokerBridge:
         capability = payload.get("capability")
         if not isinstance(capability, str):
             raise PermissionError("missing broker capability")
-        session_id = self._capability_sessions.get(capability)
-        if session_id is None:
+        binding = self._capability_bindings.get(capability)
+        if binding is None:
             raise PermissionError("invalid broker capability")
+        session_id = binding.session_id
         context = self._active_turns.get(session_id)
         if context is None:
             raise PermissionError("no active turn for credential request")
+        if binding.actor != context.actor:
+            raise PermissionError("broker capability origin actor does not own the active turn")
 
         request = _parse_request(payload)
         outcome: Literal["allowed", "denied", "error"] = "error"
@@ -257,16 +308,24 @@ class CredentialBrokerBridge:
                     turn_id=context.turn_id,
                     actor=context.actor.copy(),
                 )
-                grant = await self._provider.issue(provider_context, request)
+                grant = await asyncio.wait_for(
+                    self._provider.issue(provider_context, request),
+                    timeout=self._provider_timeout,
+                )
             except PermissionError:
                 outcome = "denied"
                 raise PermissionError("credential provider denied request") from None
             except Exception as exc:
                 raise RuntimeError("credential provider failed") from exc
-            _validate_grant(request, grant)
+            _validate_grant(request, grant, expected_actor=context.actor)
+            executable = self._executables.get(request.tool)
+            if (request.tool == "gh" or request.operation == "identity") and executable is None:
+                raise RuntimeError(f"trusted {request.tool} executable is unavailable")
             outcome = "allowed"
             return {
                 "ok": True,
+                "executable": executable,
+                "artifact_dir": str(self._artifact_dir),
                 "grant": {
                     "username": grant.username,
                     "secret": grant.secret,
@@ -329,7 +388,14 @@ def _parse_request(payload: dict[str, object]) -> CredentialRequest:
     )
 
 
-def _validate_grant(request: CredentialRequest, grant: CredentialGrant) -> None:
+def _validate_grant(
+    request: CredentialRequest,
+    grant: CredentialGrant,
+    *,
+    expected_actor: ActorContext,
+) -> None:
+    if grant.actor != expected_actor:
+        raise ValueError("credential provider returned an actor that does not own the active turn")
     if not grant.username:
         raise ValueError("credential provider returned an empty username")
     if request.operation == "credential" and request.action == "get" and not grant.secret:
