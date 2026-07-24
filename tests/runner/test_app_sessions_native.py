@@ -11537,7 +11537,7 @@ async def test_required_terminal_exit_while_idle_does_not_fail_session(tmp_path:
             instance,
         )
         # The session reached idle (turn completed) before the pane vanished.
-        resource_registry._last_session_status[conv_id] = "idle"
+        resource_registry._last_session_status[conv_id] = ("idle", "turn_idle")
         on_exit = callbacks.get("on_exit")
         assert callable(on_exit)
         on_exit()
@@ -11716,11 +11716,14 @@ async def test_external_idle_status_makes_required_terminal_exit_clean(tmp_path:
             instance,
             resource_role=KIRO_NATIVE_TERMINAL_ROLE,
         )
-        resource_registry.note_session_turn_started(conv_id)
+        resource_registry.note_session_turn_started(conv_id, turn_id="turn_kiro")
         async with _runner_client(app) as client:
             status_resp = await client.post(
                 f"/v1/sessions/{conv_id}/events",
-                json={"type": "external_session_status", "data": {"status": "idle"}},
+                json={
+                    "type": "external_session_status",
+                    "data": {"status": "idle", "turn_id": "turn_kiro"},
+                },
             )
         assert status_resp.status_code == 204, status_resp.text
 
