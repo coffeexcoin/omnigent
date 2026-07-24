@@ -123,9 +123,18 @@ async def test_concurrent_generation_reservations_are_unique(db_uri: str) -> Non
     assert sorted(generations) == list(range(1, 33))
 
 
+@pytest.mark.parametrize(
+    "message",
+    [
+        "UNIQUE constraint failed: managed_credential_leases.workspace_id, "
+        "managed_credential_leases.host_id, managed_credential_leases.generation",
+        "(1062, Duplicate entry '0-host-2' for key 'managed_credential_leases.PRIMARY')",
+    ],
+)
 def test_generation_collision_retries_beyond_fixed_replica_budget(
     db_uri: str,
     monkeypatch: pytest.MonkeyPatch,
+    message: str,
 ) -> None:
     """A synchronized burst is bounded by time, not a small attempt count."""
     store = HostStore(db_uri)
@@ -136,10 +145,7 @@ def test_generation_collision_retries_beyond_fixed_replica_budget(
         nonlocal attempts
         attempts += 1
         if attempts <= 9:
-            cause = RuntimeError(
-                "UNIQUE constraint failed: managed_credential_leases.workspace_id, "
-                "managed_credential_leases.host_id, managed_credential_leases.generation"
-            )
+            cause = RuntimeError(message)
             raise sa.exc.IntegrityError("INSERT", {}, cause)
         return real_insert(**kwargs)  # type: ignore[arg-type]
 

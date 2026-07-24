@@ -2044,7 +2044,11 @@ async def launch_managed_host(
     host_name = f"managed-{host_id[:8]}"
     try:
         await asyncio.to_thread(launcher.prepare)
-        sandbox_id, provision_cancelled = await _to_thread_settled(launcher.provision, host_name)
+        sandbox_id = await _provision_sandbox(
+            launcher,
+            host_name=host_name,
+            host_id=host_id,
+        )
     except click.ClickException as exc:
         raise HTTPException(
             status_code=502,
@@ -2060,7 +2064,6 @@ async def launch_managed_host(
         sandbox_id=sandbox_id,
         repo=repo,
         on_stage=on_stage,
-        cancel_after_arm=provision_cancelled,
     )
     return ManagedHostLaunch(host_id=host_id, workspace=workspace)
 
@@ -2186,7 +2189,11 @@ async def relaunch_managed_host(
         )
     try:
         await asyncio.to_thread(launcher.prepare)
-        sandbox_id, provision_cancelled = await _to_thread_settled(launcher.provision, host.name)
+        sandbox_id = await _provision_sandbox(
+            launcher,
+            host_name=host.name,
+            host_id=host.host_id,
+        )
     except click.ClickException as exc:
         raise HTTPException(
             status_code=502,
@@ -2208,7 +2215,6 @@ async def relaunch_managed_host(
         on_stage=on_stage,
         keep_host_on_failure=True,
         expected_sandbox_id=host.sandbox_id,
-        cancel_after_arm=provision_cancelled,
     )
     return ManagedHostLaunch(host_id=host.host_id, workspace=workspace)
 
@@ -2260,6 +2266,56 @@ async def _to_thread_settled(
             cancelled = True
             if worker.done():
                 return worker.result(), True
+
+
+async def _provision_sandbox(
+    launcher: SandboxLauncher,
+    *,
+    host_name: str,
+    host_id: str,
+) -> str:
+    """Detach cancelled provision calls and tear down any late sandbox result."""
+    worker = asyncio.create_task(asyncio.to_thread(launcher.provision, host_name))
+    try:
+        return await asyncio.shield(worker)
+    except asyncio.CancelledError:
+        _track_late_sandbox_provision(worker, launcher, host_id=host_id)
+        raise
+
+
+def _track_late_sandbox_provision(
+    worker: asyncio.Task[str],
+    launcher: SandboxLauncher,
+    *,
+    host_id: str,
+) -> None:
+    """Consume a detached provision result and asynchronously retire its sandbox."""
+    _BACKGROUND_CREDENTIAL_TASKS.add(worker)
+
+    def _settled(task: asyncio.Task[str]) -> None:
+        _BACKGROUND_CREDENTIAL_TASKS.discard(task)
+        try:
+            sandbox_id = task.result()
+        except asyncio.CancelledError:
+            return
+        except Exception:  # noqa: BLE001 — provider details may contain secrets
+            _logger.warning(
+                "Cancelled managed sandbox provision failed after detachment for host %s",
+                host_id,
+            )
+            return
+        cleanup = asyncio.create_task(
+            _terminate_sandbox_id_best_effort(
+                launcher,
+                sandbox_id=sandbox_id,
+                provider=launcher.provider,
+                host_id=host_id,
+            )
+        )
+        _BACKGROUND_CREDENTIAL_TASKS.add(cleanup)
+        cleanup.add_done_callback(_BACKGROUND_CREDENTIAL_TASKS.discard)
+
+    worker.add_done_callback(_settled)
 
 
 class _CredentialOwnerLost(RuntimeError):
@@ -2643,7 +2699,6 @@ async def _arm_and_start_host(
     on_stage: Callable[[str], None] | None = None,
     keep_host_on_failure: bool = False,
     expected_sandbox_id: str | None = None,
-    cancel_after_arm: bool = False,
 ) -> str:
     """
     Arm the credential, start the in-sandbox host, and await its
@@ -2722,9 +2777,6 @@ async def _arm_and_start_host(
         )
         if registration_cancelled:
             raise asyncio.CancelledError
-        if cancel_after_arm:
-            raise asyncio.CancelledError
-
         if config.credential_hook is not None and lease_record is not None:
             lease = await _acquire_credential_lease(
                 config.credential_hook,

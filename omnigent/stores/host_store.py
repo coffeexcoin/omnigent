@@ -225,6 +225,10 @@ def _is_credential_generation_conflict(exc: IntegrityError) -> bool:
     if getattr(diagnostic, "constraint_name", None) == ("pk_managed_credential_leases"):
         return True
     message = str(exc.orig).lower()
+    if "duplicate entry" in message and (
+        "managed_credential_leases.primary" in message or "pk_managed_credential_leases" in message
+    ):
+        return True
     return (
         "managed_credential_leases" in message
         and "generation" in message

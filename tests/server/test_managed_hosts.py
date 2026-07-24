@@ -3625,7 +3625,7 @@ async def test_launch_owner_renews_while_credential_acquire_is_blocked(
 
 
 async def test_cancelled_provision_is_armed_before_cleanup(db_uri: str) -> None:
-    """Cancellation waits for provision to return, then durably tears it down."""
+    """Cancellation returns promptly and tears down a sandbox produced later."""
     gate = threading.Event()
     host_store = HostStore(db_uri)
     launcher = FakeSandboxLauncher(provision_gate=gate)
@@ -3638,13 +3638,17 @@ async def test_cancelled_provision_is_armed_before_cleanup(db_uri: str) -> None:
     )
     await asyncio.sleep(0.05)
     launch.cancel()
-    await asyncio.sleep(0.05)
-    assert not launch.done()
+    with pytest.raises(asyncio.CancelledError):
+        await asyncio.wait_for(launch, timeout=2)
     assert launcher.terminated == []
 
     gate.set()
-    with pytest.raises(asyncio.CancelledError):
-        await asyncio.wait_for(launch, timeout=2)
+    for _ in range(100):
+        if launcher.terminated:
+            break
+        await asyncio.sleep(0.02)
+    else:
+        pytest.fail("late provisioned sandbox was not terminated")
 
     assert launcher.provisioned_names
     assert launcher.terminated == ["sb-fake-1"]
