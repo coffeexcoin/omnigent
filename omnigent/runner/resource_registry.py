@@ -298,7 +298,7 @@ class SessionResourceRegistry:
         # mid-turn crash. Written from the watcher thread and the turn-start
         # hook; all access goes through the ``_*_session_status_memo`` helpers
         # under ``self._lock``.
-        self._last_session_status: dict[str, str] = {}
+        self._last_session_status: dict[str, tuple[str, str | None]] = {}
         # Optional callback invoked on the event loop when a watched terminal
         # disappears unexpectedly. The callback receives the terminal's
         # lifecycle relationship so the runner can decide whether the owning
@@ -404,17 +404,28 @@ class SessionResourceRegistry:
         if tasks:
             await asyncio.gather(*tasks)
 
-    def _set_session_status_memo(self, session_id: str, status: str) -> None:
+    def _set_session_status_memo(
+        self,
+        session_id: str,
+        status: str,
+        *,
+        turn_id: str | None = None,
+    ) -> None:
         """Record the session's latest PTY status for exit classification."""
         with self._lock:
-            self._last_session_status[session_id] = status
+            if not turn_id:
+                current = self._last_session_status.get(session_id)
+                if current is None or not current[1]:
+                    return
+                turn_id = current[1]
+            self._last_session_status[session_id] = (status, turn_id)
 
-    def _take_session_status_memo(self, session_id: str) -> str | None:
+    def _take_session_status_memo(self, session_id: str) -> tuple[str, str | None] | None:
         """Pop and return the session's recorded PTY status (or ``None``)."""
         with self._lock:
             return self._last_session_status.pop(session_id, None)
 
-    def note_session_turn_started(self, session_id: str) -> None:
+    def note_session_turn_started(self, session_id: str, *, turn_id: str | None = None) -> None:
         """Mark a session as having an in-flight turn.
 
         Closes the window between a new turn starting and the watcher's first
@@ -424,9 +435,16 @@ class SessionResourceRegistry:
 
         :param session_id: Session/conversation identifier, e.g. ``"conv_abc"``.
         """
-        self._set_session_status_memo(session_id, "running")
+        if turn_id:
+            self._set_session_status_memo(session_id, "running", turn_id=turn_id)
 
-    def note_external_session_status(self, session_id: str, status: str) -> None:
+    def note_external_session_status(
+        self,
+        session_id: str,
+        status: str,
+        *,
+        turn_id: str | None = None,
+    ) -> None:
         """Record a terminal-observed external status for exit classification.
 
         Structured native forwarders can know turn completion more reliably than
@@ -438,10 +456,14 @@ class SessionResourceRegistry:
         :param session_id: Session/conversation identifier, e.g. ``"conv_abc"``.
         :param status: External native status, e.g. ``"running"`` or ``"idle"``.
         """
-        if status == "idle":
-            self._set_session_status_memo(session_id, "idle")
-        elif status in {"running", "waiting"}:
-            self._set_session_status_memo(session_id, "running")
+        if not turn_id or status not in {"idle", "running", "waiting"}:
+            return
+        normalized = "idle" if status == "idle" else "running"
+        with self._lock:
+            current = self._last_session_status.get(session_id)
+            if current is None or current[1] != turn_id:
+                return
+            self._last_session_status[session_id] = (normalized, turn_id)
 
     @property
     def terminal_registry(self) -> TerminalRegistry | None:
@@ -1208,7 +1230,13 @@ class SessionResourceRegistry:
         command, args_count, cwd, last_output = _terminal_exit_diagnostics(instance)
         # Idle = clean shutdown after the turn finished. Anything else (running,
         # or never observed → boot failure) stays a failure.
-        session_was_idle = self._take_session_status_memo(session_id) == "idle"
+        status_memo = self._take_session_status_memo(session_id)
+        session_was_idle = (
+            status_memo is not None
+            and status_memo[0] == "idle"
+            and isinstance(status_memo[1], str)
+            and bool(status_memo[1])
+        )
 
         if self._terminal_registry is not None:
             try:

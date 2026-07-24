@@ -475,6 +475,7 @@ async def test_required_terminal_exit_while_idle_is_clean_shutdown(tmp_path: Pat
     callbacks = await _observe_native_agent_terminal_and_capture(
         registry, terminal_registry, instance, "conv_idle"
     )
+    registry.note_session_turn_started("conv_idle", turn_id="turn_idle")
 
     # The agent worked, then its turn completed (pane quiesced → idle).
     on_activity = callbacks["on_activity"]
@@ -482,6 +483,7 @@ async def test_required_terminal_exit_while_idle_is_clean_shutdown(tmp_path: Pat
     assert callable(on_activity) and callable(on_idle)
     on_activity()
     on_idle()
+    registry.note_external_session_status("conv_idle", "idle", turn_id="turn_idle")
     # Then the pane disappeared (e.g. Claude Code exited cleanly).
     on_exit = callbacks["on_exit"]
     assert callable(on_exit)
@@ -610,7 +612,7 @@ async def test_required_terminal_exit_after_new_turn_is_failure(tmp_path: Path) 
     on_idle = callbacks["on_idle"]
     assert callable(on_idle)
     on_idle()
-    registry.note_session_turn_started("conv_turn")
+    registry.note_session_turn_started("conv_turn", turn_id="turn_current")
     on_exit = callbacks["on_exit"]
     assert callable(on_exit)
     on_exit()
@@ -628,7 +630,7 @@ async def test_cleanup_session_clears_status_memo(tmp_path: Path) -> None:
     """
     del tmp_path
     registry = SessionResourceRegistry()
-    registry.note_session_turn_started("conv_cleanup")
+    registry.note_session_turn_started("conv_cleanup", turn_id="turn_cleanup")
     assert "conv_cleanup" in registry._last_session_status
 
     await registry.cleanup_session("conv_cleanup")
@@ -678,13 +680,25 @@ async def test_transfer_terminal_moves_status_memo(
         TerminalEnvSpec(command="codex", args=["--remote", "ws://127.0.0.1:1234"]),
         resource_role=CODEX_NATIVE_TERMINAL_ROLE,
     )
-    registry.note_session_turn_started("conv_src")
+    registry.note_session_turn_started("conv_src", turn_id="turn_src")
 
     moved = await registry.transfer_terminal("conv_src", "conv_dst", view.id)
 
     assert moved is not None
     assert "conv_src" not in registry._last_session_status
-    assert registry._last_session_status.get("conv_dst") == "running"
+    assert registry._last_session_status.get("conv_dst") == ("running", "turn_src")
+
+
+def test_external_status_requires_current_originating_turn() -> None:
+    registry = SessionResourceRegistry()
+    registry.note_session_turn_started("conv_fenced", turn_id="turn_b")
+
+    registry.note_external_session_status("conv_fenced", "idle")
+    registry.note_external_session_status("conv_fenced", "idle", turn_id="turn_a")
+
+    assert registry._last_session_status["conv_fenced"] == ("running", "turn_b")
+    registry.note_external_session_status("conv_fenced", "idle", turn_id="turn_b")
+    assert registry._last_session_status["conv_fenced"] == ("idle", "turn_b")
 
 
 def test_get_resource_finds_default() -> None:

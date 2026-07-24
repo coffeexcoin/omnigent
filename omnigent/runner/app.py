@@ -8281,7 +8281,7 @@ def create_runner_app(
         if credential_bridge is None:
             return None
         if actor is None:
-            credential_bridge.clear_turn(session_id)
+            credential_bridge.deactivate_session(session_id)
             return None
         from omnigent.runner.credential_broker import ActiveCredentialTurn
 
@@ -8349,6 +8349,10 @@ def create_runner_app(
     # conv_id → live turn's response_id; gates the mid-turn injection forward so
     # a buffered message isn't sent to a harness with no live turn (→ 204).
     _live_response_id: dict[str, str] = {}
+    # Native status forwarders know their immutable response id, not the server
+    # item id used for credential authority. Capture the association at the
+    # running edge; terminal cleanup must never consult mutable active state.
+    _credential_status_turns: dict[tuple[str, str], str] = {}
     _session_start_cache: dict[str, float] = {}  # session_id → registered start time
     _session_spec_cache: dict[str, Any | None] = {}  # session_id → session AgentSpec
     # Single source for the session's server snapshot. created_at,
@@ -15346,6 +15350,10 @@ def create_runner_app(
                                     _response_id = resp_obj.get("id")
                                     if _response_id and conv_id:
                                         _resp_to_conv[_response_id] = conv_id
+                                        if credential_turn_id is not None:
+                                            _credential_status_turns[(conv_id, _response_id)] = (
+                                                credential_turn_id
+                                            )
                                         # Mark the turn live for the forward gate.
                                         _live_response_id[conv_id] = _response_id
                                         # Register the live turn with the process
@@ -15853,7 +15861,11 @@ def create_runner_app(
             # watcher's first ``running`` edge isn't misread as a clean
             # shutdown against the prior turn's stale ``idle`` memo.
             if _is_native_harness(conversation_id):
-                resource_registry.note_session_turn_started(conversation_id)
+                raw_turn_id = message_body.get("persisted_item_id")
+                resource_registry.note_session_turn_started(
+                    conversation_id,
+                    turn_id=raw_turn_id if isinstance(raw_turn_id, str) else None,
+                )
 
             # Take an arrival slot, then wait at the FIFO gate so this
             # conversation's messages reach the turn-vs-buffer decision in
@@ -16132,14 +16144,27 @@ def create_runner_app(
             status = data.get("status") if isinstance(data, dict) else None
             forwarded_output = data.get("output") if isinstance(data, dict) else None
             output = forwarded_output if isinstance(forwarded_output, str) else None
+            forwarded_response_id = data.get("response_id") if isinstance(data, dict) else None
             delivery_ack: _SubagentDeliveryAck | None = None
             recovered_entry: _SubagentWorkEntry | None = None
             # Keep this allowlist in sync with Omnigent server's
             # ``_EXTERNAL_SESSION_STATUS_VALUES``. These events are produced by
             # native terminal forwarders, so AP-forwarded output is the only
             # authoritative transcript source.
+            forwarded_turn_id: object = None
             if status in ("running", "waiting", "idle", "failed"):
-                resource_registry.note_external_session_status(conversation_id, status)
+                forwarded_turn_id = data.get("turn_id") if isinstance(data, dict) else None
+                if not (isinstance(forwarded_turn_id, str) and forwarded_turn_id) and isinstance(
+                    forwarded_response_id, str
+                ):
+                    forwarded_turn_id = _credential_status_turns.get(
+                        (conversation_id, forwarded_response_id)
+                    )
+                resource_registry.note_external_session_status(
+                    conversation_id,
+                    status,
+                    turn_id=forwarded_turn_id if isinstance(forwarded_turn_id, str) else None,
+                )
                 _fan_out_child_delta_to_parent(
                     conversation_id,
                     {"type": "session.status", "status": status},
@@ -16148,16 +16173,22 @@ def create_runner_app(
                 )
             if status in ("idle", "failed"):
                 if credential_bridge is not None:
-                    forwarded_turn_id = data.get("turn_id") if isinstance(data, dict) else None
-                    expected_turn_id = (
-                        forwarded_turn_id
-                        if isinstance(forwarded_turn_id, str) and forwarded_turn_id
-                        else credential_bridge.active_turn_id(conversation_id)
-                    )
-                    if expected_turn_id is not None:
+                    if not (
+                        isinstance(forwarded_turn_id, str) and forwarded_turn_id
+                    ) and isinstance(forwarded_response_id, str):
+                        forwarded_turn_id = _credential_status_turns.pop(
+                            (conversation_id, forwarded_response_id),
+                            None,
+                        )
+                    elif isinstance(forwarded_response_id, str):
+                        _credential_status_turns.pop(
+                            (conversation_id, forwarded_response_id),
+                            None,
+                        )
+                    if isinstance(forwarded_turn_id, str) and forwarded_turn_id:
                         credential_bridge.clear_turn(
                             conversation_id,
-                            turn_id=expected_turn_id,
+                            turn_id=forwarded_turn_id,
                         )
                 # Rebuild a lost / never-registered work entry from the snapshot
                 # first, so a reconnect-wiped map or a sys_session_create child

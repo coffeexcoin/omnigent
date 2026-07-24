@@ -2,22 +2,19 @@
 
 from __future__ import annotations
 
+import base64
 import json
 import os
-import shlex
 import socket
-import subprocess
 import sys
-import tempfile
 from collections.abc import Mapping, Sequence
-from pathlib import Path
 
 from omnigent.runner.credential_broker import (
     BROKER_CAPABILITY_ENV,
     BROKER_ENDPOINT_ENV,
 )
 
-_DENIED_GH_ACTIONS = frozenset({"auth", "extension"})
+_MAX_BROKER_MESSAGE = 3 * 1024 * 1024
 
 
 def _broker_request(payload: Mapping[str, object]) -> dict[str, object]:
@@ -31,43 +28,70 @@ def _broker_request(payload: Mapping[str, object]) -> dict[str, object]:
     body = dict(payload)
     body["capability"] = capability
     encoded = json.dumps(body, separators=(",", ":")).encode() + b"\n"
-    if len(encoded) > 64 * 1024:
+    if len(encoded) > _MAX_BROKER_MESSAGE:
         raise RuntimeError("credential broker request is too large")
 
     with socket.create_connection((host, port), timeout=10.0) as connection:
         connection.sendall(encoded)
         stream = connection.makefile("rb")
-        raw = stream.readline(64 * 1024 + 1)
-    if not raw or len(raw) > 64 * 1024 or not raw.endswith(b"\n"):
+        raw = stream.readline(_MAX_BROKER_MESSAGE + 1)
+    if not raw or len(raw) > _MAX_BROKER_MESSAGE or not raw.endswith(b"\n"):
         raise RuntimeError("credential broker returned an invalid response")
     response = json.loads(raw)
     if not isinstance(response, dict) or response.get("ok") is not True:
         detail = response.get("error") if isinstance(response, dict) else None
-        raise RuntimeError(str(detail or "credential broker denied the request"))
-    if not isinstance(response.get("grant"), dict):
-        raise RuntimeError("credential broker returned no grant")
+        raise RuntimeError(f"credential broker request failed: {detail or 'denied'}")
     return response
 
 
-def _grant_from_response(response: Mapping[str, object]) -> dict[str, object]:
-    grant = response.get("grant")
-    if not isinstance(grant, dict):
-        raise RuntimeError("credential broker returned no grant")
-    return grant
+def _read_stdin() -> bytes:
+    """Read bounded piped input without blocking interactive invocations."""
+
+    if sys.stdin.isatty():
+        return b""
+    stream = getattr(sys.stdin, "buffer", sys.stdin)
+    try:
+        value = stream.read(1024 * 1024 + 1)
+    except OSError:
+        return b""
+    data = value.encode() if isinstance(value, str) else value
+    if len(data) > 1024 * 1024:
+        raise RuntimeError("credential broker stdin is too large")
+    return data
 
 
-def _executable_from_response(response: Mapping[str, object], tool: str) -> str:
-    executable = response.get("executable")
-    if not isinstance(executable, str) or not executable:
-        raise RuntimeError(f"real {tool} executable is unavailable")
-    return executable
+def _write_stream(name: str, encoded: object) -> None:
+    if not isinstance(encoded, str):
+        raise RuntimeError(f"credential broker returned invalid {name}")
+    data = base64.b64decode(encoded, validate=True)
+    stream = getattr(getattr(sys, name), "buffer", getattr(sys, name))
+    try:
+        stream.write(data)
+    except TypeError:
+        stream.write(data.decode(errors="replace"))
+    stream.flush()
 
 
-def _artifact_dir_from_response(response: Mapping[str, object]) -> str:
-    artifact_dir = response.get("artifact_dir")
-    if not isinstance(artifact_dir, str) or not artifact_dir:
-        raise RuntimeError("credential broker returned no invocation directory")
-    return artifact_dir
+def _execute(tool: str, argv: Sequence[str]) -> int:
+    payload: dict[str, object] = {
+        "tool": tool,
+        "operation": "execute",
+        "argv": list(argv),
+        "cwd": os.getcwd(),
+        "stdin": base64.b64encode(_read_stdin()).decode("ascii"),
+    }
+    if tool == "gh":
+        payload["host"] = "github.com"
+    response = _broker_request(payload)
+    result = response.get("result")
+    if not isinstance(result, dict):
+        raise RuntimeError("credential broker returned no execution result")
+    _write_stream("stdout", result.get("stdout"))
+    _write_stream("stderr", result.get("stderr"))
+    returncode = result.get("returncode")
+    if not isinstance(returncode, int):
+        raise RuntimeError("credential broker returned invalid exit status")
+    return returncode
 
 
 def _gh_action(argv: Sequence[str]) -> str:
@@ -120,55 +144,9 @@ def _git_action(argv: Sequence[str]) -> str:
 
 
 def run_git(argv: Sequence[str]) -> int:
-    """Execute real Git with brokered identity and a process-local helper."""
+    """Ask the broker to execute bounded Git without returning credentials."""
 
-    response = _broker_request(
-        {
-            "tool": "git",
-            "operation": "identity",
-            "action": _git_action(argv),
-        }
-    )
-    real_git = _executable_from_response(response, "git")
-    artifact_dir = _artifact_dir_from_response(response)
-    grant = _grant_from_response(response)
-    name = grant.get("git_user_name")
-    email = grant.get("git_user_email")
-    if not isinstance(name, str) or not name or not isinstance(email, str) or not email:
-        raise RuntimeError("credential broker returned no Git commit identity")
-
-    helper = f"!{shlex.quote(sys.executable)} -m omnigent.runner.credential_wrapper git-credential"
-    deny_ssh = f"{shlex.quote(sys.executable)} -m omnigent.runner.credential_wrapper deny-ssh"
-    with tempfile.TemporaryDirectory(
-        prefix="git-",
-        dir=artifact_dir,
-    ) as config_dir:
-        global_config = Path(config_dir) / "config"
-        global_config.touch(mode=0o600)
-        env = dict(os.environ)
-        env["GIT_CONFIG_GLOBAL"] = str(global_config)
-        env["GIT_TERMINAL_PROMPT"] = "0"
-        env.pop("GIT_ASKPASS", None)
-        env.pop("SSH_ASKPASS", None)
-        global_args, command_args = _split_git_global_args(argv)
-        command = [
-            real_git,
-            *global_args,
-            "-c",
-            f"user.name={name}",
-            "-c",
-            f"user.email={email}",
-            "-c",
-            "credential.helper=",
-            "-c",
-            f"credential.helper={helper}",
-            "-c",
-            "credential.useHttpPath=true",
-            "-c",
-            f"core.sshCommand={deny_ssh}",
-            *command_args,
-        ]
-        return subprocess.run(command, env=env, check=False).returncode
+    return _execute("git", argv)
 
 
 def _read_git_credential_input() -> dict[str, str]:
@@ -188,67 +166,16 @@ def _read_git_credential_input() -> dict[str, str]:
 
 
 def run_git_credential(operation: str) -> int:
-    """Implement Git's credential-helper protocol without persisting secrets."""
+    """Reject the former raw-credential helper boundary."""
 
-    if operation not in ("get", "store", "erase"):
-        raise RuntimeError(f"unsupported git credential operation: {operation}")
-    fields = _read_git_credential_input()
-    response = _broker_request(
-        {
-            "tool": "git",
-            "operation": "credential",
-            "action": operation,
-            "protocol": fields.get("protocol"),
-            "host": fields.get("host"),
-            "path": fields.get("path"),
-        }
-    )
-    grant = _grant_from_response(response)
-    if operation != "get":
-        return 0
-    username = grant.get("username")
-    secret = grant.get("secret")
-    if not isinstance(username, str) or not username or not isinstance(secret, str) or not secret:
-        raise RuntimeError("credential broker returned an incomplete Git credential")
-    sys.stdout.write(f"username={username}\npassword={secret}\n\n")
-    return 0
+    del operation
+    raise PermissionError("raw Git credential requests are unavailable")
 
 
 def run_gh(argv: Sequence[str]) -> int:
-    """Execute real gh with a per-invocation token and isolated config dir."""
+    """Ask the broker to execute bounded gh without returning its token."""
 
-    action = _gh_action(argv)
-    if action in _DENIED_GH_ACTIONS:
-        raise PermissionError(f"gh {action} commands are unavailable with brokered credentials")
-    host = os.environ.get("GH_HOST", "github.com")
-    response = _broker_request(
-        {
-            "tool": "gh",
-            "operation": "credential",
-            "action": action,
-            "host": host,
-        }
-    )
-    real_gh = _executable_from_response(response, "gh")
-    artifact_dir = _artifact_dir_from_response(response)
-    grant = _grant_from_response(response)
-    secret = grant.get("secret")
-    if not isinstance(secret, str) or not secret:
-        raise RuntimeError("credential broker returned no GitHub token")
-
-    with tempfile.TemporaryDirectory(
-        prefix="gh-",
-        dir=artifact_dir,
-    ) as config_dir:
-        env = dict(os.environ)
-        env.pop("GITHUB_TOKEN", None)
-        env.pop("GH_TOKEN", None)
-        env.pop("GITHUB_ENTERPRISE_TOKEN", None)
-        env.pop("GH_ENTERPRISE_TOKEN", None)
-        token_env = "GH_TOKEN" if host == "github.com" else "GH_ENTERPRISE_TOKEN"
-        env[token_env] = secret
-        env["GH_CONFIG_DIR"] = config_dir
-        return subprocess.run([real_gh, *argv], env=env, check=False).returncode
+    return _execute("gh", argv)
 
 
 def main(argv: Sequence[str] | None = None) -> int:
